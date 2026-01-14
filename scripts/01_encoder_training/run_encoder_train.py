@@ -1,305 +1,606 @@
+#!/usr/bin/env python
 """
-CUDA Extension Training Script for Audio Gaussian Splatting.
+Encoder Training Script for GaborGridEncoder (DDP Enabled)
 
-Uses custom C++/CUDA kernels for maximum performance with
-Flexible Training Strategy:
-  - Searchable densify_until_ratio (not hard-coded)
-  - Soft LR Decay for structure params (τ, ω) in final phase
-  - No hard parameter freezing (allows micro-adjustments)
+Trains the encoder to predict Gabor atom parameters directly from audio.
+Uses the differentiable GaborRenderer as the decoder for reconstruction loss.
+
+Usage:
+    torchrun --nproc_per_node=4 scripts/02_encoder_training/train_encoder.py --config configs/AudioGS_config.yaml
 """
 
-import os
 import sys
-import argparse
-import yaml
+import os
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, Optional
 
-import torch
-import torch.distributed as dist
-from torch.optim.lr_scheduler import LambdaLR
-from tqdm import tqdm
-
-# Add paths - navigate to project root
+# Setup paths
 SCRIPT_DIR = Path(__file__).parent.absolute()
-PROJECT_ROOT = SCRIPT_DIR.parent.parent  # scripts/01_atom_fitting -> scripts -> GS-TS
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "cuda_gabor"))
 
-from models.atom import AudioGSModel
-from cuda_gabor import get_cuda_gabor_renderer
+import argparse
+import time
+import yaml
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from tqdm import tqdm
+import wandb
+import numpy as np
+
+from models.encoder import build_encoder
 from losses.spectral_loss import CombinedAudioLoss
-from utils.data_loader import get_dataloader
-from utils.density_control import AdaptiveDensityController, rebuild_optimizer_from_model
-from utils.visualization import Visualizer
+
+# Optional quality metrics
+try:
+    from pesq import pesq
+    PESQ_AVAILABLE = True
+except ImportError:
+    PESQ_AVAILABLE = False
+    print("[Warning] pesq not available")
+
+# CUDA renderer
+try:
+    from cuda_gabor import get_cuda_gabor_renderer
+    RENDERER_AVAILABLE = True
+except ImportError:
+    RENDERER_AVAILABLE = False
+    print("[Error] CUDA renderer not available!")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="AudioGS Training (CUDA Extension)")
-    parser.add_argument("--target_file", type=str, default=None)
-    parser.add_argument("--data_path", type=str, 
-                        default="/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R")
-    parser.add_argument("--config", type=str, default="configs/AudioGS_config.yaml")
-    parser.add_argument("--max_iters", type=int, default=None)
-    parser.add_argument("--output_dir", type=str, default="logs")
-    parser.add_argument("--exp_name", type=str, default=None)
-    parser.add_argument("--local_rank", type=int, default=-1)
-    return parser.parse_args()
-
-
-def load_config(path: str) -> Dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def setup_distributed():
+def setup_ddp():
+    """Initialize Distributed Data Parallel."""
     if "RANK" in os.environ:
+        dist.init_process_group("nccl")
         rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend="nccl", init_method="env://")
+        world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
-        return True, rank, world_size, local_rank
-    return False, 0, 1, 0
+        print(f"[DDP] Initialized Rank {rank}/{world_size} (Local {local_rank})")
+        return rank, local_rank, world_size
+    else:
+        print("[DDP] Not using distributed mode (Single GPU)")
+        return 0, 0, 1
 
 
-def cleanup_distributed():
+def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
-# ============================================================
-# Soft LR Decay Scheduler
-# ============================================================
-
-def create_soft_decay_scheduler(
-    optimizer: torch.optim.Optimizer,
-    max_iters: int,
-    decay_start_ratio: float = 0.8,  # Start decay at 80% of training
-    decay_factor: float = 0.1,       # Reduce structure LR to 10%
-) -> LambdaLR:
-    """
-    Create scheduler that softly decays structure parameter LRs in final phase.
-    
-    Unlike hard freezing, this allows micro-adjustments while slowing down
-    structural changes to prevent overfitting.
-    
-    Args:
-        optimizer: Optimizer with param groups
-        max_iters: Total training iterations
-        decay_start_ratio: When to start decaying (0.8 = last 20%)
-        decay_factor: How much to reduce LR (0.1 = 10x slower)
-    """
-    decay_start = int(max_iters * decay_start_ratio)
-    
-    def lr_lambda(iteration: int) -> float:
-        if iteration < decay_start:
-            return 1.0
-        else:
-            # Linear interpolation from 1.0 to decay_factor
-            progress = (iteration - decay_start) / (max_iters - decay_start)
-            return 1.0 - progress * (1.0 - decay_factor)
-    
-    return LambdaLR(optimizer, lr_lambda)
+def is_rank_zero():
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def train(args, config: Dict):
-    is_distributed, rank, world_size, local_rank = setup_distributed()
-    is_main = (rank == 0)
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+class AudioDataset(Dataset):
+    """Dataset for loading audio files."""
     
-    # Output dir
-    if args.exp_name is None:
-        exp_name = f"cuda_ext_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    else:
-        exp_name = args.exp_name
-    
-    output_dir = Path(args.output_dir) / exp_name
-    if is_main:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[CUDA-Ext] Output: {output_dir}")
-        print(f"[CUDA-Ext] Device: {device}")
-    
-    # Config
-    sample_rate = config["data"]["sample_rate"]
-    max_iters = args.max_iters or config["training"]["max_iters"]
-    
-    # Density control settings (FLEXIBLE - searchable)
-    dc = config["density_control"]
-    densify_from_iter = dc.get("densify_from_iter", 500)
-    densify_until_ratio = dc.get("densify_until_ratio", 0.7)
-    densify_until_iter = int(max_iters * densify_until_ratio)
-    densification_interval = dc.get("densification_interval", 150)
-    
-    # Soft LR decay settings
-    lr_decay_start = config["training"].get("lr_decay_start_ratio", 0.8)
-    lr_decay_factor = config["training"].get("lr_decay_factor", 0.1)
-    
-    if is_main:
-        print(f"[Flexible] Densify: [{densify_from_iter}, {densify_until_iter}] (ratio={densify_until_ratio})")
-        print(f"[Flexible] LR decay: start={lr_decay_start}, factor={lr_decay_factor}")
-    
-    # Data
-    dataloader, _ = get_dataloader(
-        root_path=args.data_path,
-        target_file=args.target_file,
-        batch_size=1,
-        sample_rate=sample_rate,
-        max_audio_length=config["data"]["max_audio_length"],
-        subsets=config["data"].get("subsets"),
-        shuffle=False,
-    )
-    
-    fixed_batch = next(iter(dataloader))
-    gt_waveform = fixed_batch["waveforms"][0].to(device)
-    num_samples = int(fixed_batch["lengths"][0].item())
-    audio_duration = num_samples / sample_rate
-    
-    if is_main:
-        print(f"[CUDA-Ext] Target: {fixed_batch['file_paths'][0]}")
-        print(f"[CUDA-Ext] Duration: {audio_duration:.2f}s")
-    
-    # Model with F0-guided initialization
-    model = AudioGSModel(
-        num_atoms=config["model"]["initial_num_atoms"],
-        sample_rate=sample_rate,
-        audio_duration=audio_duration,
-        device=device,
-    )
-    model.initialize_from_audio(gt_waveform, use_f0_init=True)
-    
-    # CUDA Extension Renderer
-    renderer = get_cuda_gabor_renderer(sample_rate=sample_rate)
-    
-    # Loss function with phase loss
-    loss_config = config["loss"]
-    loss_fn = CombinedAudioLoss(
-        sample_rate=sample_rate,
-        fft_sizes=loss_config["fft_sizes"],
-        hop_sizes=loss_config["hop_sizes"],
-        win_lengths=loss_config["win_lengths"],
-        stft_weight=loss_config.get("spectral_weight", 1.0),
-        mel_weight=loss_config.get("mel_weight", 0.5),
-        time_weight=loss_config.get("time_domain_weight", 0.1),
-        phase_weight=loss_config.get("phase_weight", 0.5),  # NEW
-        amp_reg_weight=loss_config.get("amp_reg_weight", 0.01),
-        pre_emp_weight=loss_config.get("pre_emp_weight", 20.0),
-    )
-    
-    # Optimizer
-    optimizer = rebuild_optimizer_from_model(model, torch.optim.Adam, config["training"])
-    
-    # Soft decay scheduler (NO HARD FREEZING)
-    scheduler = create_soft_decay_scheduler(
-        optimizer, max_iters,
-        decay_start_ratio=lr_decay_start,
-        decay_factor=lr_decay_factor,
-    )
-    
-    # Density Controller
-    density_controller = AdaptiveDensityController(
-        grad_threshold=dc["grad_threshold"],
-        sigma_split_threshold=dc["sigma_split_threshold"],
-        prune_amplitude_threshold=dc["prune_amplitude_threshold"],
-        max_num_atoms=config["model"]["max_num_atoms"],
-    )
-    
-    # Visualizer
-    if is_main:
-        visualizer = Visualizer(str(output_dir), sample_rate)
-        visualizer.save_audio(gt_waveform, "target_gt")
-        pbar = tqdm(range(max_iters), desc="Training (Flexible)")
-    else:
-        pbar = range(max_iters)
-    
-    # ========================================
-    # FLEXIBLE TRAINING LOOP (No Hard Freezing)
-    # ========================================
-    
-    for iteration in pbar:
-        # Forward pass
-        amplitude, tau, omega, sigma, phi, gamma = model.get_all_params()
-        pred_waveform = renderer(amplitude, tau, omega, sigma, phi, gamma, num_samples)
+    def __init__(
+        self, 
+        data_path: str,
+        sample_rate: int = 24000,
+        max_length_sec: float = 5.0,
+        min_length_sec: float = 1.0,
+    ):
+        self.data_path = Path(data_path)
+        self.sample_rate = sample_rate
+        self.max_samples = int(max_length_sec * sample_rate)
+        self.min_samples = int(min_length_sec * sample_rate)
         
-        # Loss
-        loss, loss_dict = loss_fn(
-            pred_waveform, gt_waveform,
-            model_amplitude=amplitude,
-            model_sigma=sigma,
-            sigma_diversity_weight=dc.get("sigma_diversity_weight", 0.001),
+        # Find all wav files
+        self.files = list(self.data_path.rglob("*.wav"))
+        if is_rank_zero():
+            print(f"[Dataset] Found {len(self.files)} audio files in {data_path}")
+        
+    def __len__(self):
+        return len(self.files)
+    
+    def __getitem__(self, idx):
+        audio_path = self.files[idx]
+        
+        # Load audio
+        # Note: In a real DDP scenario with huge datasets, ensure file opening is safe
+        try:
+            waveform, sr = torchaudio.load(str(audio_path))
+        except Exception as e:
+            print(f"Error loading {audio_path}: {e}")
+            return torch.zeros(1, self.min_samples), self.min_samples
+        
+        # Convert to mono
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        waveform = waveform.squeeze(0)
+        
+        # Resample if needed
+        if sr != self.sample_rate:
+            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
+        
+        # Truncate or pad
+        if len(waveform) > self.max_samples:
+            # Random crop
+            start = torch.randint(0, len(waveform) - self.max_samples, (1,)).item()
+            waveform = waveform[start:start + self.max_samples]
+        elif len(waveform) < self.min_samples:
+            # Pad with zeros
+            waveform = F.pad(waveform, (0, self.min_samples - len(waveform)))
+        
+        return waveform, len(waveform)
+
+
+def collate_fn(batch):
+    """Collate function for variable length audio."""
+    waveforms, lengths = zip(*batch)
+    
+    # Pad to max length in batch
+    max_len = max(lengths)
+    padded = torch.stack([
+        F.pad(w, (0, max_len - len(w))) for w in waveforms
+    ])
+    
+    return padded, torch.tensor(lengths)
+
+
+def compute_si_sdr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute Scale-Invariant Signal-to-Distortion Ratio."""
+    # Ensure shapes match
+    if pred.shape != target.shape:
+        min_len = min(pred.shape[-1], target.shape[-1])
+        pred = pred[..., :min_len]
+        target = target[..., :min_len]
+
+    # Remove mean
+    pred = pred - pred.mean(dim=-1, keepdim=True)
+    target = target - target.mean(dim=-1, keepdim=True)
+    
+    # Compute SI-SDR
+    dot = (pred * target).sum(dim=-1, keepdim=True)
+    s_target = dot * target / (target.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+    e_noise = pred - s_target
+    
+    si_sdr = 10 * torch.log10(
+        s_target.pow(2).sum(dim=-1) / (e_noise.pow(2).sum(dim=-1) + 1e-8) + 1e-8
+    )
+    
+    return si_sdr.mean()
+
+
+class EncoderTrainer:
+    """Training manager for GaborGridEncoder."""
+    
+    def __init__(
+        self,
+        config: dict,
+        device: torch.device,
+        rank: int,
+    ):
+        self.config = config
+        self.device = device
+        self.rank = rank
+        self.is_master = (rank == 0)
+        
+        # Extract configs
+        self.data_config = config.get('data', {})
+        self.enc_config = config.get('encoder_model', {})
+        self.train_config = config.get('training', {})
+        self.loss_config = config.get('loss', {})
+        
+        self.sample_rate = self.data_config.get('sample_rate', 24000)
+        
+        # Build encoder
+        self.encoder = build_encoder(config).to(device)
+        
+        if self.is_master:
+            print(f"[Encoder] Parameters: {sum(p.numel() for p in self.encoder.parameters()):,}")
+            print(f"[Encoder] Atoms/second capacity: {self.encoder.atoms_per_second:,}")
+        
+        # Wrap DDP
+        if dist.is_initialized():
+            self.encoder = DDP(
+                self.encoder, 
+                device_ids=[device.index],
+                find_unused_parameters=config.get('distributed', {}).get('find_unused_parameters', False)
+            )
+        
+        # Build renderer
+        if not RENDERER_AVAILABLE:
+            raise RuntimeError("CUDA renderer required!")
+        self.renderer = get_cuda_gabor_renderer(sample_rate=self.sample_rate)
+        
+        # Build loss
+        self.loss_fn = CombinedAudioLoss(
+            sample_rate=self.sample_rate,
+            fft_sizes=self.loss_config.get('fft_sizes', [2048, 1024, 512]),
+            hop_sizes=self.loss_config.get('hop_sizes', [512, 256, 128]),
+            win_lengths=self.loss_config.get('win_lengths', [2048, 1024, 512]),
+            stft_weight=self.loss_config.get('spectral_weight', 1.0),
+            mel_weight=self.loss_config.get('mel_weight', 0.5),
+            time_weight=self.loss_config.get('time_domain_weight', 0.1),
+            phase_weight=self.loss_config.get('phase_weight', 0.8),
+            amp_reg_weight=self.loss_config.get('amp_reg_weight', 0.01),
+            pre_emp_weight=self.loss_config.get('pre_emp_weight', 20.0),
+        ).to(device)
+        
+        self.sparsity_weight = self.loss_config.get('sparsity_weight', 0.0)
+        
+        # Optimizer
+        learning_rate = float(self.train_config.get('learning_rate', 5e-4))
+        self.optimizer = torch.optim.AdamW(
+            self.encoder.parameters(),
+            lr=learning_rate,
+            weight_decay=1e-4,
         )
         
+        # Schedulers
+        warmup_steps = self.train_config.get('warmup_steps', 1000)
+        max_epochs = self.train_config.get('max_epochs', 100)
+        
+        self.warmup_scheduler = LinearLR(
+            self.optimizer, 
+            start_factor=0.01, 
+            end_factor=1.0, 
+            total_iters=warmup_steps
+        )
+        self.main_scheduler = CosineAnnealingLR(
+            self.optimizer, 
+            T_max=max_epochs - (warmup_steps // 1000 if warmup_steps >= 1000 else 0) 
+        )
+        
+        self.global_step = 0
+        self.epoch = 0
+        
+    def render_batch(
+        self, 
+        enc_output: dict, 
+        num_samples: int,
+    ) -> torch.Tensor:
+        """Render audio from encoder output (batch)."""
+        batch_size = enc_output['amplitude'].shape[0]
+        reconstructed = []
+        
+        for b in range(batch_size):
+            # Renderer expects contiguous tensors
+            recon = self.renderer(
+                enc_output['amplitude'][b].contiguous(),
+                enc_output['tau'][b].contiguous(),
+                enc_output['omega'][b].contiguous(),
+                enc_output['sigma'][b].contiguous(),
+                enc_output['phi'][b].contiguous(),
+                enc_output['gamma'][b].contiguous(),
+                num_samples,
+            )
+            reconstructed.append(recon)
+        
+        return torch.stack(reconstructed, dim=0)
+    
+    def train_step(self, batch: torch.Tensor) -> dict:
+        """Single training step."""
+        audio, lengths = batch
+        audio = audio.to(self.device, non_blocking=True)
+        num_samples = audio.shape[-1]
+        
+        # Forward through encoder
+        enc_output = self.encoder(audio)
+        
+        # Render reconstruction
+        reconstructed = self.render_batch(enc_output, num_samples)
+        
+        # 1. Reconstruction Loss
+        loss, loss_dict = self.loss_fn(reconstructed, audio, 
+                                       model_amplitude=enc_output['amplitude'],
+                                       model_sigma=enc_output['sigma'])
+        
+        # 2. Sparsity Loss [CRITICAL]
+        # Penalize the mean probability of atoms existing
+        existence_prob_mean = enc_output['existence_prob'].mean()
+        sparsity_loss = self.sparsity_weight * existence_prob_mean
+        
+        loss = loss + sparsity_loss
+        
+        # Update dict
+        loss_dict['sparsity'] = sparsity_loss.item()
+        loss_dict['total'] = loss.item() # Update total
+        
         # Backward
-        optimizer.zero_grad()
+        self.optimizer.zero_grad()
         loss.backward()
-        model.accumulate_gradients()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()  # Soft LR decay
         
-        # Density control (SEARCHABLE boundaries)
-        density_controller.update_thresholds(loss.item())
-        if densify_from_iter <= iteration < densify_until_iter:
-            if iteration % densification_interval == 0 and iteration > 0:
-                stats = density_controller.densify_and_prune(model, optimizer)
-                if is_main and (stats["split"] > 0 or stats["cloned"] > 0):
-                    tqdm.write(f"[Density] iter={iteration}: split={stats['split']}, "
-                              f"cloned={stats['cloned']}, total={model.num_atoms}")
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
         
-        # Logging
-        if is_main:
-            visualizer.log_loss(iteration, loss_dict["total"])
-            if iteration % config["training"]["log_interval"] == 0:
-                current_lr = scheduler.get_last_lr()[0]
-                pbar.set_postfix({
-                    "loss": f"{loss_dict['total']:.4f}", 
-                    "atoms": model.num_atoms,
-                    "lr": f"{current_lr:.5f}",
-                })
-            
-            if iteration % config["training"]["vis_interval"] == 0 and iteration > 0:
-                with torch.no_grad():
-                    visualizer.generate_all_visualizations(
-                        gt_waveform, pred_waveform.detach(), model, iteration
-                    )
-    
-    # Final output
-    if is_main:
-        print("\n[CUDA-Ext] Training Complete!")
+        self.optimizer.step()
+        
+        # Step scheduler
+        if self.global_step < self.train_config.get('warmup_steps', 1000):
+            self.warmup_scheduler.step()
+        
+        self.global_step += 1
+        
+        # Compute active atom ratio (for logging)
         with torch.no_grad():
-            amplitude, tau, omega, sigma, phi, gamma = model.get_all_params()
-            pred = renderer(amplitude, tau, omega, sigma, phi, gamma, num_samples)
-            visualizer.generate_all_visualizations(gt_waveform, pred, model, max_iters, prefix="final")
+            active_ratio = (enc_output['existence_prob'] > 0.5).float().mean().item()
         
-        torch.save({
-            "iteration": max_iters,
-            "model_state": model.state_dict_full(),
-            "config": config,
-        }, output_dir / "checkpoint_final.pt")
-        
-        print(f"[CUDA-Ext] Final atoms: {model.num_atoms}")
-        print(f"[CUDA-Ext] Checkpoint: {output_dir / 'checkpoint_final.pt'}")
+        return {
+            'loss': loss.item(),
+            'active_ratio': active_ratio,
+            **{k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()},
+        }
     
-    cleanup_distributed()
+    @torch.no_grad()
+    def validate(self, val_loader: DataLoader, max_batches: int = 20) -> dict:
+        """Run validation."""
+        self.encoder.eval()
+        
+        all_losses = []
+        all_si_sdr = []
+        all_pesq = []
+        all_active_ratio = []
+        
+        # To avoid DDP hanging, minimal validation on rank 0 is often sufficient 
+        # for these metrics, or gather. Here we just run on each rank and average.
+        
+        for i, batch in enumerate(val_loader):
+            if i >= max_batches:
+                break
+                
+            audio, lengths = batch
+            audio = audio.to(self.device)
+            num_samples = audio.shape[-1]
+            
+            # Forward
+            enc_output = self.encoder(audio)
+            reconstructed = self.render_batch(enc_output, num_samples)
+            
+            # Loss
+            loss, _ = self.loss_fn(reconstructed, audio)
+            all_losses.append(loss.item())
+            
+            # SI-SDR
+            si_sdr = compute_si_sdr(reconstructed, audio)
+            all_si_sdr.append(si_sdr.item())
+            
+            # Active ratio
+            active = (enc_output['existence_prob'] > 0.5).float().mean().item()
+            all_active_ratio.append(active)
+            
+            # PESQ (Expensive, only compute on Rank 0 and a few samples)
+            if self.is_master and PESQ_AVAILABLE and i < 5:
+                try:
+                    ref_16k = torchaudio.functional.resample(
+                        audio[0].cpu(), self.sample_rate, 16000
+                    ).numpy()
+                    deg_16k = torchaudio.functional.resample(
+                        reconstructed[0].cpu(), self.sample_rate, 16000
+                    ).numpy()
+                    pesq_score = pesq(16000, ref_16k, deg_16k, 'wb')
+                    all_pesq.append(pesq_score)
+                except Exception as e:
+                    # print(f"PESQ failed: {e}")
+                    pass
+        
+        self.encoder.train()
+        
+        # Aggregate metrics from all ranks would be ideal, but minimal simple avg is okay for now
+        results = {
+            'val_loss': np.mean(all_losses) if all_losses else 0.0,
+            'val_si_sdr': np.mean(all_si_sdr) if all_si_sdr else 0.0,
+            'val_active_ratio': np.mean(all_active_ratio) if all_active_ratio else 0.0,
+        }
+        
+        if all_pesq:
+            results['val_pesq'] = np.mean(all_pesq)
+            
+        return results
+    
+    def save_checkpoint(self, path: str, extra: dict = None):
+        """Save training checkpoint (Rank 0 only)."""
+        if not self.is_master:
+            return
+            
+        # Unwrap DDP
+        model_state = self.encoder.module.state_dict() if isinstance(self.encoder, DDP) else self.encoder.state_dict()
+        
+        checkpoint = {
+            'epoch': self.epoch,
+            'global_step': self.global_step,
+            'encoder_state': model_state,
+            'optimizer_state': self.optimizer.state_dict(),
+            'config': self.config,
+        }
+        if extra:
+            checkpoint.update(extra)
+        torch.save(checkpoint, path)
+        print(f"[Checkpoint] Saved to {path}")
+        
+    def load_checkpoint(self, path: str):
+        """Load training checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        # Unwrap DDP for loading
+        if isinstance(self.encoder, DDP):
+            self.encoder.module.load_state_dict(checkpoint['encoder_state'])
+        else:
+            self.encoder.load_state_dict(checkpoint['encoder_state'])
+            
+        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        self.epoch = checkpoint.get('epoch', 0)
+        self.global_step = checkpoint.get('global_step', 0)
+        if self.is_master:
+            print(f"[Checkpoint] Loaded from epoch {self.epoch}, step {self.global_step}")
+
+
+def train(args, config):
+    """Main training function."""
+    rank, local_rank, world_size = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}")
+    
+    # Initialize wandb (Rank 0 only)
+    if is_rank_zero() and args.use_wandb:
+        wandb.init(
+            project="AudioGS-Encoder",
+            config=config,
+            name=args.exp_name,
+        )
+    
+    # Create trainer
+    trainer = EncoderTrainer(config, device, rank)
+    
+    # Create datasets
+    data_path = config['data']['dataset_path']
+    train_config = config.get('training', {})
+    
+    train_dataset = AudioDataset(
+        data_path=os.path.join(data_path, "train-clean-100"), # Or iterate dict
+        sample_rate=config['data']['sample_rate'],
+        max_length_sec=config['data'].get('max_audio_length', 5.0),
+    )
+    
+    val_dataset = AudioDataset(
+        data_path=os.path.join(data_path, "dev-clean"), # Or similar
+        sample_rate=config['data']['sample_rate'],
+        max_length_sec=config['data'].get('max_audio_length', 5.0),
+    )
+    
+    # DistributedSampler
+    train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist.is_initialized() else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist.is_initialized() else None
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_config.get('batch_size', 16),
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=4,
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=train_config.get('batch_size', 16) // 2,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=2,
+        collate_fn=collate_fn,
+    )
+    
+    # Training loop
+    max_epochs = train_config.get('max_epochs', 100)
+    val_interval = train_config.get('val_interval', 1000)
+    save_interval = train_config.get('save_interval', 5000)
+    log_interval = train_config.get('log_interval', 10)
+    
+    output_dir = Path(f"logs/encoder_{args.exp_name}")
+    if is_rank_zero():
+        output_dir.mkdir(parents=True, exist_ok=True)
+    
+    if is_rank_zero():
+        print(f"\n{'='*60}")
+        print(f"GaborGridEncoder Training")
+        print(f"{'='*60}")
+        print(f"Train samples: {len(train_dataset)}")
+        print(f"Val samples: {len(val_dataset)}")
+        print(f"GPUs: {world_size}")
+        print(f"Output: {output_dir}")
+        print(f"{'='*60}\n")
+    
+    best_val_loss = float('inf')
+    
+    for epoch in range(max_epochs):
+        if dist.is_initialized():
+            train_sampler.set_epoch(epoch)
+            
+        trainer.epoch = epoch
+        
+        if is_rank_zero():
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
+        else:
+            pbar = train_loader
+        
+        for batch in pbar:
+            metrics = trainer.train_step(batch)
+            
+            if is_rank_zero():
+                pbar.set_postfix({
+                    'loss': f"{metrics['loss']:.4f}",
+                    'active': f"{metrics['active_ratio']:.1%}",
+                    'spars': f"{metrics.get('sparsity', 0):.4f}",
+                })
+                
+                # Log to wandb
+                if args.use_wandb and trainer.global_step % log_interval == 0:
+                    wandb.log({
+                        'train/loss': metrics['loss'],
+                        'train/active_ratio': metrics['active_ratio'],
+                        'train/sparsity_loss': metrics.get('sparsity', 0.0),
+                        'train/phase_loss': metrics.get('phase', 0.0),
+                        'train/spectral_loss': metrics.get('stft', 0.0),
+                        'train/mel_loss': metrics.get('mel', 0.0),
+                        'train/lr': trainer.optimizer.param_groups[0]['lr'],
+                        'step': trainer.global_step,
+                    })
+            
+            # Validation
+            if trainer.global_step % val_interval == 0:
+                val_metrics = trainer.validate(val_loader)
+                
+                if is_rank_zero():
+                    print(f"\n[Val] Step {trainer.global_step}: "
+                          f"Loss={val_metrics['val_loss']:.4f}, "
+                          f"SI-SDR={val_metrics['val_si_sdr']:.2f}, "
+                          f"Active={val_metrics['val_active_ratio']:.1%}")
+                    
+                    if 'val_pesq' in val_metrics:
+                        print(f"       PESQ={val_metrics['val_pesq']:.3f}")
+                    
+                    if args.use_wandb:
+                        wandb.log({f'val/{k}': v for k, v in val_metrics.items()})
+                    
+                    # Save best
+                    if val_metrics['val_loss'] < best_val_loss:
+                        best_val_loss = val_metrics['val_loss']
+                        trainer.save_checkpoint(
+                            str(output_dir / "best_model.pt"),
+                            extra={'val_metrics': val_metrics}
+                        )
+            
+            # Save checkpoint
+            if trainer.global_step % save_interval == 0:
+                trainer.save_checkpoint(
+                    str(output_dir / f"checkpoint_{trainer.global_step}.pt")
+                )
+        
+        # End of epoch
+        trainer.main_scheduler.step()
+    
+    # Final save
+    trainer.save_checkpoint(str(output_dir / "final_model.pt"))
+    
+    if is_rank_zero() and args.use_wandb:
+        wandb.finish()
+    
+    cleanup_ddp()
+    if is_rank_zero():
+        print("Training Complete!")
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Train GaborGridEncoder")
+    parser.add_argument("--config", type=str, default="configs/AudioGS_config.yaml")
+    parser.add_argument("--exp_name", type=str, default="v1")
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--resume", type=str, default=None)
     
-    config_path = args.config
-    if not Path(config_path).is_absolute():
-        config_path = PROJECT_ROOT / config_path
+    args = parser.parse_args()
     
-    config = load_config(str(config_path))
-    
-    print("=" * 60)
-    print("Audio Gaussian Splatting (C++/CUDA EXTENSION)")
-    print("Flexible Training + Phase Loss")
-    print("=" * 60)
-    if args.target_file:
-        print(f"Target: {args.target_file}")
-    print("=" * 60)
+    # Load config
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
     
     train(args, config)
 
