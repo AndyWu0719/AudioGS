@@ -222,9 +222,9 @@ class GaborGridEncoder(nn.Module):
                 # 1. Existence bias (Index 0) -> +2.0 (~88% active at start)
                 bias[:, :, 0].fill_(2.0)
                 
-                # 2. Amplitude bias (Index 1) -> -5.0 (Softplus(-5) ≈ 0.0067)
+                # 2. Amplitude bias (Index 1) -> -12.0 (Softplus(-12) ≈ 6e-6)
                 #    Start with LOW energy to prevent loss explosion
-                bias[:, :, 1].fill_(-5.0)
+                bias[:, :, 1].fill_(-12.0)
                 
                 # 3. Phase bias (Index 2) -> Uniform[-π, π]
                 bias[:, :, 2].uniform_(-math.pi, math.pi)
