@@ -219,10 +219,14 @@ class GaborGridEncoder(nn.Module):
                     self.grid_freq_bins, self.atoms_per_cell, self.num_params
                 )
                 
-                # 1. Existence bias (Index 0) -> +2.0
+                # 1. Existence bias (Index 0) -> +2.0 (~88% active at start)
                 bias[:, :, 0].fill_(2.0)
                 
-                # 2. Phase bias (Index 2) -> Uniform[-π, π]
+                # 2. Amplitude bias (Index 1) -> -5.0 (Softplus(-5) ≈ 0.0067)
+                #    Start with LOW energy to prevent loss explosion
+                bias[:, :, 1].fill_(-5.0)
+                
+                # 3. Phase bias (Index 2) -> Uniform[-π, π]
                 bias[:, :, 2].uniform_(-math.pi, math.pi)
                 
                 # Flatten back

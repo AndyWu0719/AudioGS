@@ -5,8 +5,11 @@ Encoder Training Script for GaborGridEncoder (DDP Enabled)
 Trains the encoder to predict Gabor atom parameters directly from audio.
 Uses the differentiable GaborRenderer as the decoder for reconstruction loss.
 
+REFACTORED: Step-based training (not epoch-based).
+
 Usage:
-    torchrun --nproc_per_node=4 scripts/02_encoder_training/train_encoder.py --config configs/AudioGS_config.yaml
+    torchrun --nproc_per_node=4 scripts/01_encoder_training/run_encoder_train.py \
+        --config configs/AudioGS_config.yaml --use_wandb
 """
 
 import sys
@@ -20,7 +23,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "cuda_gabor"))
 
 import argparse
-import time
 import yaml
 import torch
 import torch.nn as nn
@@ -29,7 +31,7 @@ import torchaudio
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 import wandb
 import numpy as np
@@ -43,7 +45,6 @@ try:
     PESQ_AVAILABLE = True
 except ImportError:
     PESQ_AVAILABLE = False
-    print("[Warning] pesq not available")
 
 # CUDA renderer
 try:
@@ -62,10 +63,8 @@ def setup_ddp():
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
-        print(f"[DDP] Initialized Rank {rank}/{world_size} (Local {local_rank})")
         return rank, local_rank, world_size
     else:
-        print("[DDP] Not using distributed mode (Single GPU)")
         return 0, 0, 1
 
 
@@ -118,13 +117,10 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         audio_path = self.files[idx]
         
-        # Load audio
-        # Note: In a real DDP scenario with huge datasets, ensure file opening is safe
         try:
             waveform, sr = torchaudio.load(str(audio_path))
         except Exception as e:
-            print(f"Error loading {audio_path}: {e}")
-            return torch.zeros(1, self.min_samples), self.min_samples
+            return torch.zeros(self.min_samples), self.min_samples
         
         # Convert to mono
         if waveform.shape[0] > 1:
@@ -137,11 +133,9 @@ class AudioDataset(Dataset):
         
         # Truncate or pad
         if len(waveform) > self.max_samples:
-            # Random crop
             start = torch.randint(0, len(waveform) - self.max_samples, (1,)).item()
             waveform = waveform[start:start + self.max_samples]
         elif len(waveform) < self.min_samples:
-            # Pad with zeros
             waveform = F.pad(waveform, (0, self.min_samples - len(waveform)))
         
         return waveform, len(waveform)
@@ -150,29 +144,23 @@ class AudioDataset(Dataset):
 def collate_fn(batch):
     """Collate function for variable length audio."""
     waveforms, lengths = zip(*batch)
-    
-    # Pad to max length in batch
     max_len = max(lengths)
     padded = torch.stack([
         F.pad(w, (0, max_len - len(w))) for w in waveforms
     ])
-    
     return padded, torch.tensor(lengths)
 
 
 def compute_si_sdr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Compute Scale-Invariant Signal-to-Distortion Ratio."""
-    # Ensure shapes match
     if pred.shape != target.shape:
         min_len = min(pred.shape[-1], target.shape[-1])
         pred = pred[..., :min_len]
         target = target[..., :min_len]
 
-    # Remove mean
     pred = pred - pred.mean(dim=-1, keepdim=True)
     target = target - target.mean(dim=-1, keepdim=True)
     
-    # Compute SI-SDR
     dot = (pred * target).sum(dim=-1, keepdim=True)
     s_target = dot * target / (target.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
     e_noise = pred - s_target
@@ -180,25 +168,18 @@ def compute_si_sdr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     si_sdr = 10 * torch.log10(
         s_target.pow(2).sum(dim=-1) / (e_noise.pow(2).sum(dim=-1) + 1e-8) + 1e-8
     )
-    
     return si_sdr.mean()
 
 
 class EncoderTrainer:
-    """Training manager for GaborGridEncoder."""
+    """Training manager for GaborGridEncoder (Step-Based)."""
     
-    def __init__(
-        self,
-        config: dict,
-        device: torch.device,
-        rank: int,
-    ):
+    def __init__(self, config: dict, device: torch.device, rank: int):
         self.config = config
         self.device = device
         self.rank = rank
         self.is_master = (rank == 0)
         
-        # Extract configs
         self.data_config = config.get('data', {})
         self.enc_config = config.get('encoder_model', {})
         self.train_config = config.get('training', {})
@@ -211,7 +192,6 @@ class EncoderTrainer:
         
         if self.is_master:
             print(f"[Encoder] Parameters: {sum(p.numel() for p in self.encoder.parameters()):,}")
-            print(f"[Encoder] Atoms/second capacity: {self.encoder.atoms_per_second:,}")
         
         # Wrap DDP
         if dist.is_initialized():
@@ -240,7 +220,7 @@ class EncoderTrainer:
             pre_emp_weight=self.loss_config.get('pre_emp_weight', 20.0),
         ).to(device)
         
-        self.sparsity_weight = self.loss_config.get('sparsity_weight', 0.0)
+        self.sparsity_weight = self.loss_config.get('sparsity_weight', 0.001)
         
         # Optimizer
         learning_rate = float(self.train_config.get('learning_rate', 5e-4))
@@ -250,35 +230,31 @@ class EncoderTrainer:
             weight_decay=1e-4,
         )
         
-        # Schedulers
+        # Schedulers (Step-Based)
         warmup_steps = self.train_config.get('warmup_steps', 1000)
-        max_epochs = self.train_config.get('max_epochs', 100)
+        max_steps = self.train_config.get('max_steps', 100000)
         
-        self.warmup_scheduler = LinearLR(
-            self.optimizer, 
-            start_factor=0.01, 
-            end_factor=1.0, 
-            total_iters=warmup_steps
+        warmup_scheduler = LinearLR(
+            self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
         )
-        self.main_scheduler = CosineAnnealingLR(
+        cosine_scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=max_steps - warmup_steps
+        )
+        # Combined scheduler: warmup then cosine
+        self.scheduler = SequentialLR(
             self.optimizer, 
-            T_max=max_epochs - (warmup_steps // 1000 if warmup_steps >= 1000 else 0) 
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_steps]
         )
         
         self.global_step = 0
-        self.epoch = 0
         
-    def render_batch(
-        self, 
-        enc_output: dict, 
-        num_samples: int,
-    ) -> torch.Tensor:
+    def render_batch(self, enc_output: dict, num_samples: int) -> torch.Tensor:
         """Render audio from encoder output (batch)."""
         batch_size = enc_output['amplitude'].shape[0]
         reconstructed = []
         
         for b in range(batch_size):
-            # Renderer expects contiguous tensors
             recon = self.renderer(
                 enc_output['amplitude'][b].contiguous(),
                 enc_output['tau'][b].contiguous(),
@@ -309,54 +285,45 @@ class EncoderTrainer:
                                        model_amplitude=enc_output['amplitude'],
                                        model_sigma=enc_output['sigma'])
         
-        # 2. Sparsity Loss [CRITICAL]
-        # Penalize the mean probability of atoms existing
+        # 2. Sparsity Loss [CRITICAL] - penalize mean existence probability
         existence_prob_mean = enc_output['existence_prob'].mean()
         sparsity_loss = self.sparsity_weight * existence_prob_mean
-        
         loss = loss + sparsity_loss
         
-        # Update dict
         loss_dict['sparsity'] = sparsity_loss.item()
-        loss_dict['total'] = loss.item() # Update total
+        loss_dict['total'] = loss.item()
         
         # Backward
         self.optimizer.zero_grad()
         loss.backward()
-        
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
-        
         self.optimizer.step()
         
-        # Step scheduler
-        if self.global_step < self.train_config.get('warmup_steps', 1000):
-            self.warmup_scheduler.step()
+        # Step scheduler EVERY STEP (critical!)
+        self.scheduler.step()
         
         self.global_step += 1
         
-        # Compute active atom ratio (for logging)
+        # Active ratio
         with torch.no_grad():
             active_ratio = (enc_output['existence_prob'] > 0.5).float().mean().item()
         
         return {
             'loss': loss.item(),
             'active_ratio': active_ratio,
+            'lr': self.optimizer.param_groups[0]['lr'],
             **{k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()},
         }
     
     @torch.no_grad()
     def validate(self, val_loader: DataLoader, max_batches: int = 20) -> dict:
-        """Run validation."""
+        """Run validation with dist.all_reduce for global averaging."""
         self.encoder.eval()
         
-        all_losses = []
-        all_si_sdr = []
-        all_pesq = []
-        all_active_ratio = []
-        
-        # To avoid DDP hanging, minimal validation on rank 0 is often sufficient 
-        # for these metrics, or gather. Here we just run on each rank and average.
+        total_loss = torch.tensor(0.0, device=self.device)
+        total_si_sdr = torch.tensor(0.0, device=self.device)
+        total_active = torch.tensor(0.0, device=self.device)
+        count = torch.tensor(0, device=self.device)
         
         for i, batch in enumerate(val_loader):
             if i >= max_batches:
@@ -366,64 +333,49 @@ class EncoderTrainer:
             audio = audio.to(self.device)
             num_samples = audio.shape[-1]
             
-            # Forward
             enc_output = self.encoder(audio)
             reconstructed = self.render_batch(enc_output, num_samples)
             
-            # Loss
             loss, _ = self.loss_fn(reconstructed, audio)
-            all_losses.append(loss.item())
+            total_loss += loss
             
-            # SI-SDR
             si_sdr = compute_si_sdr(reconstructed, audio)
-            all_si_sdr.append(si_sdr.item())
+            total_si_sdr += si_sdr
             
-            # Active ratio
-            active = (enc_output['existence_prob'] > 0.5).float().mean().item()
-            all_active_ratio.append(active)
+            active = (enc_output['existence_prob'] > 0.5).float().mean()
+            total_active += active
             
-            # PESQ (Expensive, only compute on Rank 0 and a few samples)
-            if self.is_master and PESQ_AVAILABLE and i < 5:
-                try:
-                    ref_16k = torchaudio.functional.resample(
-                        audio[0].cpu(), self.sample_rate, 16000
-                    ).numpy()
-                    deg_16k = torchaudio.functional.resample(
-                        reconstructed[0].cpu(), self.sample_rate, 16000
-                    ).numpy()
-                    pesq_score = pesq(16000, ref_16k, deg_16k, 'wb')
-                    all_pesq.append(pesq_score)
-                except Exception as e:
-                    # print(f"PESQ failed: {e}")
-                    pass
+            count += 1
+        
+        # All-reduce across ranks
+        if dist.is_initialized():
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_si_sdr, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_active, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        
+        count = count.item()
         
         self.encoder.train()
         
-        # Aggregate metrics from all ranks would be ideal, but minimal simple avg is okay for now
-        results = {
-            'val_loss': np.mean(all_losses) if all_losses else 0.0,
-            'val_si_sdr': np.mean(all_si_sdr) if all_si_sdr else 0.0,
-            'val_active_ratio': np.mean(all_active_ratio) if all_active_ratio else 0.0,
+        return {
+            'val_loss': (total_loss / count).item() if count > 0 else 0.0,
+            'val_si_sdr': (total_si_sdr / count).item() if count > 0 else 0.0,
+            'val_active_ratio': (total_active / count).item() if count > 0 else 0.0,
         }
-        
-        if all_pesq:
-            results['val_pesq'] = np.mean(all_pesq)
-            
-        return results
     
     def save_checkpoint(self, path: str, extra: dict = None):
         """Save training checkpoint (Rank 0 only)."""
         if not self.is_master:
             return
             
-        # Unwrap DDP
         model_state = self.encoder.module.state_dict() if isinstance(self.encoder, DDP) else self.encoder.state_dict()
         
         checkpoint = {
-            'epoch': self.epoch,
             'global_step': self.global_step,
             'encoder_state': model_state,
             'optimizer_state': self.optimizer.state_dict(),
+            'scheduler_state': self.scheduler.state_dict(),
             'config': self.config,
         }
         if extra:
@@ -435,58 +387,58 @@ class EncoderTrainer:
         """Load training checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         
-        # Unwrap DDP for loading
         if isinstance(self.encoder, DDP):
             self.encoder.module.load_state_dict(checkpoint['encoder_state'])
         else:
             self.encoder.load_state_dict(checkpoint['encoder_state'])
             
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        self.epoch = checkpoint.get('epoch', 0)
+        if 'scheduler_state' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state'])
         self.global_step = checkpoint.get('global_step', 0)
         if self.is_master:
-            print(f"[Checkpoint] Loaded from epoch {self.epoch}, step {self.global_step}")
+            print(f"[Checkpoint] Loaded from step {self.global_step}")
 
 
 def train(args, config):
-    """Main training function."""
+    """Main training function (Step-Based)."""
     rank, local_rank, world_size = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
     
     # Initialize wandb (Rank 0 only)
     if is_rank_zero() and args.use_wandb:
-        wandb.init(
-            project="AudioGS-Encoder",
-            config=config,
-            name=args.exp_name,
-        )
+        wandb.init(project="AudioGS-Encoder", config=config, name=args.exp_name)
     
     # Create trainer
     trainer = EncoderTrainer(config, device, rank)
     
-    # Create datasets
-    data_path = config['data']['dataset_path']  # e.g., data/raw/LibriTTS_R
+    # Load checkpoint if resuming
+    if args.resume:
+        trainer.load_checkpoint(args.resume)
+    
+    # Create datasets from config
+    data_path = config['data']['dataset_path']
     train_config = config.get('training', {})
     
-    # Training: train/train-clean-100 + train/train-clean-360
-    train_paths = [
-        os.path.join(data_path, "train", "train-clean-100"),
-        os.path.join(data_path, "train", "train-clean-360"),
-    ]
+    # Training: use subsets from config
+    train_subsets = config['data'].get('subsets', ['train-clean-100'])
+    train_paths = [os.path.join(data_path, "train", subset) for subset in train_subsets]
     train_dataset = AudioDataset(
         data_paths=train_paths,
         sample_rate=config['data']['sample_rate'],
         max_length_sec=config['data'].get('max_audio_length', 5.0),
     )
     
-    # Validation: dev/dev-clean
+    # Validation: use val_subsets from config
+    val_subsets = config['data'].get('val_subsets', ['dev-clean'])
+    val_paths = [os.path.join(data_path, "dev", subset) for subset in val_subsets]
     val_dataset = AudioDataset(
-        data_paths=os.path.join(data_path, "dev", "dev-clean"),
+        data_paths=val_paths,
         sample_rate=config['data']['sample_rate'],
         max_length_sec=config['data'].get('max_audio_length', 5.0),
     )
     
-    # DistributedSampler
+    # Samplers
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist.is_initialized() else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist.is_initialized() else None
     
@@ -498,21 +450,22 @@ def train(args, config):
         num_workers=4,
         collate_fn=collate_fn,
         pin_memory=True,
+        drop_last=True,
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=train_config.get('batch_size', 16) // 2,
+        batch_size=max(1, train_config.get('batch_size', 16) // 2),
         shuffle=False,
         sampler=val_sampler,
         num_workers=2,
         collate_fn=collate_fn,
     )
     
-    # Training loop
-    max_epochs = train_config.get('max_epochs', 100)
-    val_interval = train_config.get('val_interval', 1000)
-    save_interval = train_config.get('save_interval', 5000)
+    # Training parameters
+    max_steps = train_config.get('max_steps', 100000)
+    val_interval = train_config.get('val_interval', 2000)
+    save_interval = train_config.get('save_interval', 10000)
     log_interval = train_config.get('log_interval', 10)
     
     output_dir = Path(f"logs/encoder_{args.exp_name}")
@@ -521,88 +474,92 @@ def train(args, config):
     
     if is_rank_zero():
         print(f"\n{'='*60}")
-        print(f"GaborGridEncoder Training")
+        print(f"GaborGridEncoder Training (Step-Based)")
         print(f"{'='*60}")
         print(f"Train samples: {len(train_dataset)}")
         print(f"Val samples: {len(val_dataset)}")
         print(f"GPUs: {world_size}")
+        print(f"Max steps: {max_steps}")
         print(f"Output: {output_dir}")
         print(f"{'='*60}\n")
     
     best_val_loss = float('inf')
+    epoch = 0
+    train_iter = iter(train_loader)
     
-    for epoch in range(max_epochs):
-        if dist.is_initialized():
-            train_sampler.set_epoch(epoch)
-            
-        trainer.epoch = epoch
+    # Progress bar tracks total steps
+    if is_rank_zero():
+        pbar = tqdm(total=max_steps, initial=trainer.global_step, desc="Training")
+    
+    # Step-based training loop
+    while trainer.global_step < max_steps:
+        # Get next batch, restart loader if exhausted
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            epoch += 1
+            if dist.is_initialized():
+                train_sampler.set_epoch(epoch)
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+        
+        # Train step
+        metrics = trainer.train_step(batch)
         
         if is_rank_zero():
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
-        else:
-            pbar = train_loader
+            pbar.update(1)
+            pbar.set_postfix({
+                'loss': f"{metrics['loss']:.4f}",
+                'active': f"{metrics['active_ratio']:.1%}",
+                'lr': f"{metrics['lr']:.2e}",
+            })
+            
+            # Log to wandb
+            if args.use_wandb and trainer.global_step % log_interval == 0:
+                wandb.log({
+                    'train/loss': metrics['loss'],
+                    'train/active_ratio': metrics['active_ratio'],
+                    'train/sparsity_loss': metrics.get('sparsity', 0.0),
+                    'train/lr': metrics['lr'],
+                    'epoch': epoch,
+                    'step': trainer.global_step,
+                })
         
-        for batch in pbar:
-            metrics = trainer.train_step(batch)
+        # Validation
+        if trainer.global_step % val_interval == 0 and trainer.global_step > 0:
+            val_metrics = trainer.validate(val_loader)
             
             if is_rank_zero():
-                pbar.set_postfix({
-                    'loss': f"{metrics['loss']:.4f}",
-                    'active': f"{metrics['active_ratio']:.1%}",
-                    'spars': f"{metrics.get('sparsity', 0):.4f}",
-                })
+                tqdm.write(f"\n[Val] Step {trainer.global_step}: "
+                      f"Loss={val_metrics['val_loss']:.4f}, "
+                      f"SI-SDR={val_metrics['val_si_sdr']:.2f}, "
+                      f"Active={val_metrics['val_active_ratio']:.1%}")
                 
-                # Log to wandb
-                if args.use_wandb and trainer.global_step % log_interval == 0:
-                    wandb.log({
-                        'train/loss': metrics['loss'],
-                        'train/active_ratio': metrics['active_ratio'],
-                        'train/sparsity_loss': metrics.get('sparsity', 0.0),
-                        'train/phase_loss': metrics.get('phase', 0.0),
-                        'train/spectral_loss': metrics.get('stft', 0.0),
-                        'train/mel_loss': metrics.get('mel', 0.0),
-                        'train/lr': trainer.optimizer.param_groups[0]['lr'],
-                        'step': trainer.global_step,
-                    })
-            
-            # Validation
-            if trainer.global_step % val_interval == 0:
-                val_metrics = trainer.validate(val_loader)
+                if args.use_wandb:
+                    wandb.log({f'val/{k}': v for k, v in val_metrics.items()}, 
+                              step=trainer.global_step)
                 
-                if is_rank_zero():
-                    print(f"\n[Val] Step {trainer.global_step}: "
-                          f"Loss={val_metrics['val_loss']:.4f}, "
-                          f"SI-SDR={val_metrics['val_si_sdr']:.2f}, "
-                          f"Active={val_metrics['val_active_ratio']:.1%}")
-                    
-                    if 'val_pesq' in val_metrics:
-                        print(f"       PESQ={val_metrics['val_pesq']:.3f}")
-                    
-                    if args.use_wandb:
-                        wandb.log({f'val/{k}': v for k, v in val_metrics.items()})
-                    
-                    # Save best
-                    if val_metrics['val_loss'] < best_val_loss:
-                        best_val_loss = val_metrics['val_loss']
-                        trainer.save_checkpoint(
-                            str(output_dir / "best_model.pt"),
-                            extra={'val_metrics': val_metrics}
-                        )
-            
-            # Save checkpoint
-            if trainer.global_step % save_interval == 0:
-                trainer.save_checkpoint(
-                    str(output_dir / f"checkpoint_{trainer.global_step}.pt")
-                )
+                # Save best
+                if val_metrics['val_loss'] < best_val_loss:
+                    best_val_loss = val_metrics['val_loss']
+                    trainer.save_checkpoint(
+                        str(output_dir / "best_model.pt"),
+                        extra={'val_metrics': val_metrics}
+                    )
         
-        # End of epoch
-        trainer.main_scheduler.step()
+        # Save checkpoint
+        if trainer.global_step % save_interval == 0 and trainer.global_step > 0:
+            if is_rank_zero():
+                trainer.save_checkpoint(str(output_dir / f"checkpoint_{trainer.global_step}.pt"))
+    
+    if is_rank_zero():
+        pbar.close()
     
     # Final save
-    trainer.save_checkpoint(str(output_dir / "final_model.pt"))
-    
-    if is_rank_zero() and args.use_wandb:
-        wandb.finish()
+    if is_rank_zero():
+        trainer.save_checkpoint(str(output_dir / "final_model.pt"))
+        if args.use_wandb:
+            wandb.finish()
     
     cleanup_ddp()
     if is_rank_zero():
@@ -618,7 +575,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
