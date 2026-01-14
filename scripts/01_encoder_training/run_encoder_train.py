@@ -35,7 +35,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler
 from tqdm import tqdm
 import wandb
 import numpy as np
@@ -285,7 +285,7 @@ class VAEGANTrainer:
         num_samples = audio.shape[-1]
         
         # ========== Generator Forward (AMP) ==========
-        with autocast():
+        with torch.amp.autocast('cuda'):
             enc_output = self.generator(audio)
         
         # Render in FP32 (critical!)
@@ -294,11 +294,13 @@ class VAEGANTrainer:
         # ========== Discriminator Step ==========
         self.d_optimizer.zero_grad()
         
-        with autocast():
+        with torch.amp.autocast('cuda'):
             real_d_out, real_d_feats = self.discriminator(audio)
             fake_d_out, fake_d_feats = self.discriminator(fake_audio.detach())
             d_loss = discriminator_loss(real_d_out, fake_d_out)
         
+        # Track scale before step to check if step was skipped
+        d_scale_before = self.d_scaler.get_scale()
         self.d_scaler.scale(d_loss).backward()
         self.d_scaler.step(self.d_optimizer)
         self.d_scaler.update()
@@ -306,7 +308,7 @@ class VAEGANTrainer:
         # ========== Generator Step ==========
         self.g_optimizer.zero_grad()
         
-        with autocast():
+        with torch.amp.autocast('cuda'):
             fake_d_out_g, fake_d_feats_g = self.discriminator(fake_audio)
             _, real_d_feats_g = self.discriminator(audio)
             
@@ -314,7 +316,7 @@ class VAEGANTrainer:
             fm_loss = feature_matching_loss(real_d_feats_g, fake_d_feats_g) * self.fm_weight
         
         # Loss calculation in FP32 (disabled autocast)
-        with autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             enc_fp32 = cast_to_fp32(enc_output)
             recon_loss, loss_dict = self.recon_loss_fn(
                 fake_audio.float(), audio.float(),
@@ -327,14 +329,20 @@ class VAEGANTrainer:
         
         g_loss = recon_loss + g_adv_loss.float() + fm_loss.float() + kl + sparsity
         
+        # Track scale before step to check if step was skipped
+        g_scale_before = self.g_scaler.get_scale()
         self.g_scaler.scale(g_loss).backward()
         self.g_scaler.unscale_(self.g_optimizer)
         torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
         self.g_scaler.step(self.g_optimizer)
         self.g_scaler.update()
         
-        self.g_scheduler.step()
-        self.d_scheduler.step()
+        # Only step scheduler if optimizer actually stepped (scale didn't decrease)
+        if self.g_scaler.get_scale() >= g_scale_before:
+            self.g_scheduler.step()
+        if self.d_scaler.get_scale() >= d_scale_before:
+            self.d_scheduler.step()
+        
         self.global_step += 1
         
         with torch.no_grad():

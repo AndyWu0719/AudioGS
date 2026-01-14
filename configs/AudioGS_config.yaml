@@ -22,7 +22,7 @@ encoder_model:
 
 # Training (Step-Based)
 training:
-  batch_size: 8             # Small batch for VAE+GAN
+  batch_size: 16             # Small batch for VAE+GAN
   num_workers: 8
   learning_rate: 0.0002     # G learning rate
   max_steps: 100000
