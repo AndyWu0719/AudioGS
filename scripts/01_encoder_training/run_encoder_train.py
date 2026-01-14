@@ -79,24 +79,38 @@ def is_rank_zero():
 
 
 class AudioDataset(Dataset):
-    """Dataset for loading audio files."""
+    """Dataset for loading audio files from one or more directories."""
     
     def __init__(
         self, 
-        data_path: str,
+        data_paths,  # Can be str or list of str
         sample_rate: int = 24000,
         max_length_sec: float = 5.0,
         min_length_sec: float = 1.0,
     ):
-        self.data_path = Path(data_path)
         self.sample_rate = sample_rate
         self.max_samples = int(max_length_sec * sample_rate)
         self.min_samples = int(min_length_sec * sample_rate)
         
-        # Find all wav files
-        self.files = list(self.data_path.rglob("*.wav"))
+        # Handle single path or list of paths
+        if isinstance(data_paths, str):
+            data_paths = [data_paths]
+        
+        # Find all wav files from all paths
+        self.files = []
+        for data_path in data_paths:
+            path = Path(data_path)
+            if path.exists():
+                found = list(path.rglob("*.wav"))
+                self.files.extend(found)
+                if is_rank_zero():
+                    print(f"[Dataset] Found {len(found)} audio files in {data_path}")
+            else:
+                if is_rank_zero():
+                    print(f"[Dataset] WARNING: Path does not exist: {data_path}")
+        
         if is_rank_zero():
-            print(f"[Dataset] Found {len(self.files)} audio files in {data_path}")
+            print(f"[Dataset] Total: {len(self.files)} audio files")
         
     def __len__(self):
         return len(self.files)
@@ -451,17 +465,23 @@ def train(args, config):
     trainer = EncoderTrainer(config, device, rank)
     
     # Create datasets
-    data_path = config['data']['dataset_path']
+    data_path = config['data']['dataset_path']  # e.g., data/raw/LibriTTS_R
     train_config = config.get('training', {})
     
+    # Training: train/train-clean-100 + train/train-clean-360
+    train_paths = [
+        os.path.join(data_path, "train", "train-clean-100"),
+        os.path.join(data_path, "train", "train-clean-360"),
+    ]
     train_dataset = AudioDataset(
-        data_path=os.path.join(data_path, "train-clean-100"), # Or iterate dict
+        data_paths=train_paths,
         sample_rate=config['data']['sample_rate'],
         max_length_sec=config['data'].get('max_audio_length', 5.0),
     )
     
+    # Validation: dev/dev-clean
     val_dataset = AudioDataset(
-        data_path=os.path.join(data_path, "dev-clean"), # Or similar
+        data_paths=os.path.join(data_path, "dev", "dev-clean"),
         sample_rate=config['data']['sample_rate'],
         max_length_sec=config['data'].get('max_audio_length', 5.0),
     )
