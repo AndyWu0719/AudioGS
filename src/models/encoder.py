@@ -148,7 +148,7 @@ class GaborGridEncoder(nn.Module):
         self.time_hop_sec = time_downsample_factor / sample_rate  # 10ms
         self.nyquist = sample_rate / 2
         self.freq_bin_bandwidth = self.nyquist / grid_freq_bins
-        self.num_params = 7  # existence, amp, phase, d_tau, d_omega, sigma, gamma
+        self.num_params = 8  # existence, amp, cos_phi, sin_phi, d_tau, d_omega, sigma, gamma
         self.gamma_scale = 1000.0  # Chirp rate scaling (Hz/s)
         
         # Mel-Spectrogram transform
@@ -201,33 +201,32 @@ class GaborGridEncoder(nn.Module):
         """
         Initialize custom biases for the grid head.
         
-        1. Existence Logit (Index 0): Set to +2.0.
-           Sigmoid(2.0) ≈ 0.88. This starts the model with ~88% active atoms
-           to prevent gradient vanishing/dead atoms at the start.
-           
-        2. Phase (Index 2): Set to Uniform[-π, π].
-           This provides a good initial phase distribution.
+        1. Existence Logit (Index 0): Set to +2.0 (~88% active at start)
+        2. Amplitude (Index 1): Set to -12.0 (Softplus(-12) ≈ 6e-6, low energy)
+        3. cos_phi (Index 2) and sin_phi (Index 3): No special init needed
+           (network learns to produce unit-norm outputs)
         """
-        # Access the final linear layer's bias
         final_layer = self.grid_head[-1]
         
         if final_layer.bias is not None:
             with torch.no_grad():
                 # Reshape bias to [F, A, P]
-                # P=7: [existence, amp, phase, d_tau, d_omega, sigma, gamma]
+                # P=8: [existence, amp, cos_phi, sin_phi, d_tau, d_omega, sigma, gamma]
                 bias = final_layer.bias.view(
                     self.grid_freq_bins, self.atoms_per_cell, self.num_params
                 )
                 
-                # 1. Existence bias (Index 0) -> +2.0 (~88% active at start)
+                # 1. Existence bias -> +2.0 (~88% active at start)
                 bias[:, :, 0].fill_(2.0)
                 
-                # 2. Amplitude bias (Index 1) -> -12.0 (Softplus(-12) ≈ 6e-6)
-                #    Start with LOW energy to prevent loss explosion
+                # 2. Amplitude bias -> -12.0 (Softplus(-12) ≈ 6e-6)
                 bias[:, :, 1].fill_(-12.0)
                 
-                # 3. Phase bias (Index 2) -> Uniform[-π, π]
-                bias[:, :, 2].uniform_(-math.pi, math.pi)
+                # 3. cos_phi/sin_phi: Initialize to random unit vectors
+                #    cos^2 + sin^2 = 1 helps the network learn proper phase representation
+                rand_phase = torch.rand_like(bias[:, :, 2]) * 2 * math.pi - math.pi
+                bias[:, :, 2] = torch.cos(rand_phase)  # cos_phi
+                bias[:, :, 3] = torch.sin(rand_phase)  # sin_phi
                 
                 # Flatten back
                 final_layer.bias.data = bias.view(-1)
@@ -308,19 +307,23 @@ class GaborGridEncoder(nn.Module):
         # ============================
         # 4. Parse parameters
         # ============================
-        # Indices: 0=existence, 1=amplitude, 2=phase, 3=d_tau, 4=d_omega, 5=sigma, 6=gamma
+        # Indices: 0=existence, 1=amplitude, 2=cos_phi, 3=sin_phi, 4=d_tau, 5=d_omega, 6=sigma, 7=gamma
         existence_logit = grid[..., 0]  # [B, T, F, A]
         amplitude_raw = grid[..., 1]
-        phase_raw = grid[..., 2]
-        delta_tau_raw = grid[..., 3]
-        delta_omega_raw = grid[..., 4]
-        sigma_raw = grid[..., 5]
-        gamma_raw = grid[..., 6]
+        cos_phi_raw = grid[..., 2]
+        sin_phi_raw = grid[..., 3]
+        delta_tau_raw = grid[..., 4]
+        delta_omega_raw = grid[..., 5]
+        sigma_raw = grid[..., 6]
+        gamma_raw = grid[..., 7]
         
         # Apply activations
         existence_prob = torch.sigmoid(existence_logit)
         amplitude = F.softplus(amplitude_raw)
-        phase = phase_raw  # Unbounded, renderer handles cos/sin
+        
+        # Phase recovery from cos/sin with numerical stability (epsilon prevents NaN gradients)
+        # atan2(sin, cos) gives continuous phase in [-π, π] without wrapping issues
+        phase = torch.atan2(sin_phi_raw, cos_phi_raw + 1e-7)
         
         # Local offsets: Tanh scaled to half the cell size
         delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec / 2)

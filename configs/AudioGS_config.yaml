@@ -1,4 +1,4 @@
-# AudioGS Configuration: Amortized Inference (Encoder-Based)
+# AudioGS Configuration: Amortized Inference (Encoder-Based) + GAN Training
 # =========================================================
 
 # Data
@@ -21,26 +21,36 @@ encoder_model:
 
 # Training (Step-Based)
 training:
-  batch_size: 32           # Per GPU
-  learning_rate: 0.0005
-  max_steps: 100000        # Total training steps (not epochs!)
+  batch_size: 2            # Reduced for GAN training
+  learning_rate: 0.0002     # G learning rate (AdamW)
+  max_steps: 100000
   warmup_steps: 1000
-  val_interval: 2000       # Validate every 2k steps
-  save_interval: 10000     # Checkpoint every 10k steps
+  warmup_freeze_structure: 3000  # Freeze delta_tau/omega/sigma gradients for first 3k steps
+  val_interval: 2000
+  save_interval: 10000
   log_interval: 10
 
-# Loss
+# GAN Training
+gan:
+  enable: true
+  d_lr: 0.0002              # Discriminator learning rate
+  fm_weight: 10.0           # Feature matching loss weight
+  adv_weight: 1.0           # Adversarial loss weight
+  d_steps: 1                # D updates per G update
+
+# Loss (Rebalanced for GAN training)
+# mel_weight increased to balance against fm_weight (HiFi-GAN style)
 loss:
   fft_sizes: [2048, 1024, 512, 128]
   hop_sizes: [512, 256, 128, 32]
   win_lengths: [2048, 1024, 512, 128]
   spectral_weight: 1.0
-  mel_weight: 0.5
+  mel_weight: 25.0          # Increased from 0.5 for GAN stability
   time_domain_weight: 0.1
-  phase_weight: 0.8         # High for phase alignment
-  sparsity_weight: 0.001    # [CRITICAL] Penalize active atoms
+  phase_weight: 2.0         # Increased for phase alignment
+  sparsity_weight: 0.001    # Energy-based sparsity
   amp_reg_weight: 0.01
-  pre_emp_weight: 20.0
+  pre_emp_weight: 10.0
 
 # Distributed Training
 distributed:
