@@ -1,0 +1,84 @@
+# Flow Matching Configuration for Audio Gaussian Splatting
+# Using Anchor-Based Hierarchical Architecture (DiffGS-inspired)
+# Aligned with AudioGS_config.yaml
+
+# Data (Aligned with AudioGS)
+data:
+  atom_dir: "data/atoms/LibriTTS_R/train/train-clean-100"
+  total_atoms: 16384      # 2048 anchors × 8 split = 16384 atoms
+  batch_size: 4
+  num_workers: 8
+  val_ratio: 0.05
+  sample_rate: 24000      # Same as AudioGS
+
+# Model - Anchor-Based Architecture
+model:
+  size: "base"
+  hidden_dim: 512
+  cond_dim: 512
+  text_dim: 512
+  num_layers: 12
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+  
+  # Hierarchical splitting (DiffGS-inspired)
+  num_anchors: 2048       # Attention: 2048^2 = 4M (manageable)
+  split_factor: 8         # Each anchor -> 8 atoms
+  # Effective: 2048 * 8 = 16384 atoms
+  
+  num_speakers: 500
+  
+  # Aligned with AudioGS max_num_atoms
+  max_num_atoms: 20000    # Reference from AudioGS
+
+# Text Encoder
+text_encoder:
+  embed_dim: 256
+  hidden_dim: 512
+  num_layers: 6           # Balanced encoder depth
+  num_heads: 8
+
+# Flow Matching
+flow:
+  sigma_min: 0.0001
+  use_ot: true            # Mini-batch OT coupling for straighter flows
+  solver_method: "rk4"    # ODE solver: euler, midpoint, rk4
+
+# Training
+training:
+  # ~100 epochs with 1847 samples, batch_size=4 -> 46175 steps
+  # Using 50000 for good convergence
+  max_steps: 25000
+  warmup_steps: 2000
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  grad_clip: 1.0
+  
+  # Logging (Aligned with AudioGS intervals scaled to epochs)
+  log_interval: 50        # ~Every 0.5 epoch
+  val_interval: 500       # ~Every 5 epochs
+  save_interval: 2000     # ~Every 20 epochs
+  
+  # Sampling (for validation) - OT+RK4 allows fewer steps
+  num_sampling_steps: 25  # Reduced from 50 with OT coupling
+  cfg_scale: 1.0
+
+# Optimizer
+optimizer:
+  type: "adamw"
+  betas: [0.9, 0.99]
+  eps: 0.00000001
+
+# Output
+output:
+  dir: "logs/flow"
+  save_audio: true
+  sample_rate: 24000      # Same as AudioGS
+
+# Logging
+logging:
+  use_wandb: true
+  wandb_project: "AudioGS-Flow"
+  wandb_entity: null      # Use default entity
+  wandb_run_name: null    # Auto-generated if null

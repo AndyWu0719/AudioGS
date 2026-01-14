@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuda_gabor"
+version = "0.1.0"
+description = "CUDA-accelerated Gabor atom rendering"
+requires-python = ">=3.8"
+dependencies = ["torch"]

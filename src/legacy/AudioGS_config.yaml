@@ -1,0 +1,74 @@
+# Audio Gaussian Splatting Configuration
+# ========================================
+# Flexible training with searchable densify_until_ratio
+
+# Data
+data:
+  dataset_path: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R"
+  sample_rate: 24000
+  subsets: ["train-clean-100", "train-clean-360"]
+  max_audio_length: 10.0
+
+# Model
+model:
+  initial_num_atoms: 4096
+  max_num_atoms: 16384  # Increased for higher fidelity
+
+# Training
+training:
+  batch_size: 4
+  learning_rate: 0.001
+  lr_amplitude: 0.01820902986692016
+  lr_position: 0.00010418414874128424
+  lr_frequency: 0.0013375384144741348
+  lr_sigma: 0.014100480988103629
+  lr_phase: 0.011464829306470156
+  lr_chirp: 0.002
+
+  max_epochs: 100
+  max_iters: 12000  # More atoms need more time to settle
+
+  # Soft LR Decay (no hard freezing)
+  lr_decay_start_ratio: 0.8  # Start decay at 80% of training
+  lr_decay_factor: 0.1       # Reduce structure LR to 10%
+
+  # Logging
+  log_interval: 10
+  vis_interval: 2000
+  checkpoint_interval: 1000
+
+# Density Control (FLEXIBLE - searchable boundaries)
+
+density_control:
+  densify_from_iter: 500
+  densify_until_ratio: 0.7   # SEARCHABLE - controls when to stop growing
+  densification_interval: 150
+
+  # Split/Clone thresholds
+  grad_threshold: 0.0001979694368804096
+  sigma_split_threshold: 0.003  # Must be > min_sigma (0.002) to trigger splits
+  clone_scale: 1.5
+
+  # Pruning
+  prune_amplitude_threshold: 0.0005270237050952676
+  prune_interval: 500
+
+  # Regularization
+  sigma_diversity_weight: 0.001
+
+# Loss
+loss:
+  fft_sizes: [2048, 1024, 512, 128]
+  hop_sizes: [512, 256, 128, 32]
+  win_lengths: [2048, 1024, 512, 128]
+  spectral_weight: 1.0
+  mel_weight: 0.5
+  time_domain_weight: 0.1   # Weak anchor for stability
+  phase_weight: 0.8         # High for phase alignment
+  amp_reg_weight: 0.01
+  pre_emp_weight: 20.0
+
+# Distributed Training
+distributed:
+  backend: "nccl"
+  find_unused_parameters: false

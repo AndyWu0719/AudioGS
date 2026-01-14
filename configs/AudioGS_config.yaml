@@ -1,0 +1,49 @@
+# AudioGS Configuration: Amortized Inference (Encoder-Based)
+# =========================================================
+
+# Data
+data:
+  dataset_path: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R"
+  sample_rate: 24000
+  subsets: ["train-clean-100", "train-clean-360"]
+  max_audio_length: 10.0
+
+# Encoder Model
+encoder_model:
+  input_mel_bins: 80
+  hidden_channels: 256
+  grid_freq_bins: 128
+  atoms_per_cell: 2
+  time_downsample_factor: 240  # 24000Hz / 240 = 100Hz frame rate
+  num_layers: 6
+  use_conformer: true
+
+# Training
+training:
+  batch_size: 32  # Per GPU
+  learning_rate: 0.0005
+  max_epochs: 100
+  warmup_steps: 1000
+  val_interval: 1000
+  save_interval: 5000
+  
+  # Logging
+  log_interval: 10
+
+# Loss
+loss:
+  fft_sizes: [2048, 1024, 512, 128]
+  hop_sizes: [512, 256, 128, 32]
+  win_lengths: [2048, 1024, 512, 128]
+  spectral_weight: 1.0
+  mel_weight: 0.5
+  time_domain_weight: 0.1
+  phase_weight: 0.8         # High for phase alignment
+  sparsity_weight: 0.001    # [CRITICAL] Penalize active atoms
+  amp_reg_weight: 0.01
+  pre_emp_weight: 20.0
+
+# Distributed Training
+distributed:
+  backend: "nccl"
+  find_unused_parameters: false
