@@ -7,7 +7,7 @@ data:
   sample_rate: 24000
   subsets: ["train-clean-100", "train-clean-360"]
   val_subsets: ["dev-clean"]
-  max_audio_length: 10.0
+  max_audio_length: 2.0
 
 # Encoder Model (VAE)
 encoder_model:
@@ -22,7 +22,8 @@ encoder_model:
 
 # Training (Step-Based)
 training:
-  batch_size: 4             # Small batch for VAE+GAN
+  batch_size: 8             # Small batch for VAE+GAN
+  num_workers: 8
   learning_rate: 0.0002     # G learning rate
   max_steps: 100000
   warmup_steps: 1000
@@ -56,4 +57,4 @@ loss:
 # Distributed Training
 distributed:
   backend: "nccl"
-  find_unused_parameters: true  # Needed for VAE
+  find_unused_parameters: false  # Better performance
