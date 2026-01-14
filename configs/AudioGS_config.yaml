@@ -1,4 +1,4 @@
-# AudioGS Configuration: Amortized Inference (Encoder-Based) + GAN Training
+# AudioGS Configuration: VAE-based Encoder with VITS Loss Configuration
 # =========================================================
 
 # Data
@@ -9,23 +9,23 @@ data:
   val_subsets: ["dev-clean"]
   max_audio_length: 10.0
 
-# Encoder Model
+# Encoder Model (VAE)
 encoder_model:
   input_mel_bins: 80
   hidden_channels: 256
   grid_freq_bins: 128
   atoms_per_cell: 2
-  time_downsample_factor: 240  # 24000Hz / 240 = 100Hz frame rate
+  time_downsample_factor: 240     # Mel hop: 24000/240 = 100Hz
+  latent_downsample_ratio: 2      # Latent: 100Hz/2 = 50Hz
   num_layers: 6
   use_conformer: true
 
 # Training (Step-Based)
 training:
-  batch_size: 2            # Reduced for GAN training
-  learning_rate: 0.0002     # G learning rate (AdamW)
+  batch_size: 4             # Small batch for VAE+GAN
+  learning_rate: 0.0002     # G learning rate
   max_steps: 100000
   warmup_steps: 1000
-  warmup_freeze_structure: 3000  # Freeze delta_tau/omega/sigma gradients for first 3k steps
   val_interval: 2000
   save_interval: 10000
   log_interval: 10
@@ -33,26 +33,27 @@ training:
 # GAN Training
 gan:
   enable: true
-  d_lr: 0.0002              # Discriminator learning rate
-  fm_weight: 10.0           # Feature matching loss weight
-  adv_weight: 1.0           # Adversarial loss weight
-  d_steps: 1                # D updates per G update
+  d_lr: 0.0002
+  fm_weight: 2.0            # VITS standard
+  adv_weight: 1.0           # VITS standard
 
-# Loss (Rebalanced for GAN training)
-# mel_weight increased to balance against fm_weight (HiFi-GAN style)
+# Loss (VITS Standard Configuration)
 loss:
-  fft_sizes: [2048, 1024, 512, 128]
-  hop_sizes: [512, 256, 128, 32]
-  win_lengths: [2048, 1024, 512, 128]
-  spectral_weight: 1.0
-  mel_weight: 25.0          # Increased from 0.5 for GAN stability
+  # Reconstruction
+  mel_weight: 45.0          # VITS standard (L1 Mel Loss)
+  spectral_weight: 1.0      # Multi-resolution STFT
   time_domain_weight: 0.1
-  phase_weight: 2.0         # Increased for phase alignment
-  sparsity_weight: 0.001    # Energy-based sparsity
-  amp_reg_weight: 0.01
+  phase_weight: 2.0
   pre_emp_weight: 10.0
+  
+  # VAE
+  kl_weight: 1.0            # VITS standard
+  
+  # Regularization
+  sparsity_weight: 0.001
+  amp_reg_weight: 0.01
 
 # Distributed Training
 distributed:
   backend: "nccl"
-  find_unused_parameters: false
+  find_unused_parameters: true  # Needed for VAE

@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 """
-GAN Training Script for GaborGridEncoder
+VAE-GAN Training Script for GaborVAEEncoder
 
 Features:
-- Adversarial training with MPD + MSD discriminators (HiFi-GAN style)
-- Feature matching loss for stable training
-- Step-based training with warmup
+- VAE with KL loss (VITS standard formula)
+- GAN training with MPD + MSD
+- VITS loss weights: mel=45, kl=1, fm=2, adv=1
 - Energy-based sparsity loss
-- Structural warmup (freeze delta_tau/omega/sigma for initial steps)
 
 Usage:
     torchrun --nproc_per_node=4 scripts/01_encoder_training/run_encoder_train.py \
@@ -55,6 +54,32 @@ except ImportError:
     RENDERER_AVAILABLE = False
 
 
+# ============================================================
+# KL Loss (VITS Standard)
+# ============================================================
+
+def kl_loss(mu: torch.Tensor, logs: torch.Tensor) -> torch.Tensor:
+    """
+    KL divergence loss: KL(q(z|x) || p(z))
+    where q(z|x) = N(mu, sigma^2) and p(z) = N(0, 1)
+    
+    VITS formula: -0.5 * sum(1 + 2*logs - mu^2 - exp(2*logs))
+    Sum over C,T; mean over batch.
+    
+    Args:
+        mu: Mean [B, C, T]
+        logs: Log standard deviation [B, C, T]
+    Returns:
+        KL loss (scalar)
+    """
+    kl = -0.5 * torch.sum(1 + 2*logs - mu**2 - torch.exp(2*logs), dim=[1, 2])
+    return kl.mean()
+
+
+# ============================================================
+# Utilities
+# ============================================================
+
 def setup_ddp():
     if "RANK" in os.environ:
         dist.init_process_group("nccl")
@@ -88,12 +113,9 @@ class AudioDataset(Dataset):
         for p in data_paths:
             path = Path(p)
             if path.exists():
-                found = list(path.rglob("*.wav"))
-                self.files.extend(found)
-                if is_rank_zero():
-                    print(f"[Dataset] Found {len(found)} files in {p}")
+                self.files.extend(list(path.rglob("*.wav")))
         if is_rank_zero():
-            print(f"[Dataset] Total: {len(self.files)}")
+            print(f"[Dataset] Total: {len(self.files)} files")
         
     def __len__(self):
         return len(self.files)
@@ -140,8 +162,12 @@ def compute_si_sdr(pred, target):
     return 10 * torch.log10(s_target.pow(2).sum(dim=-1) / (e_noise.pow(2).sum(dim=-1) + 1e-8) + 1e-8).mean()
 
 
-class GANTrainer:
-    """GAN Trainer with Generator (Encoder) and Discriminator."""
+# ============================================================
+# VAE-GAN Trainer
+# ============================================================
+
+class VAEGANTrainer:
+    """Trainer for VAE-based GaborEncoder with GAN."""
     
     def __init__(self, config, device, rank, output_dir):
         self.config = config
@@ -155,10 +181,11 @@ class GANTrainer:
         gan_cfg = config.get('gan', {})
         self.sample_rate = config['data']['sample_rate']
         
-        # ========== Generator (Encoder) ==========
+        # ========== Generator (VAE Encoder) ==========
         self.generator = build_encoder(config).to(device)
         if self.is_master:
             print(f"[Generator] {sum(p.numel() for p in self.generator.parameters()):,} params")
+            print(f"[Generator] Latent rate: {self.generator.latent_frames_per_second:.1f} frames/sec")
         
         if dist.is_initialized():
             self.generator = DDP(self.generator, device_ids=[device.index], find_unused_parameters=True)
@@ -176,22 +203,24 @@ class GANTrainer:
             raise RuntimeError("CUDA renderer required!")
         self.renderer = get_cuda_gabor_renderer(sample_rate=self.sample_rate)
         
-        # ========== Loss ==========
+        # ========== Losses ==========
         self.recon_loss_fn = CombinedAudioLoss(
             sample_rate=self.sample_rate,
             fft_sizes=loss_cfg.get('fft_sizes', [2048, 1024, 512]),
             hop_sizes=loss_cfg.get('hop_sizes', [512, 256, 128]),
             win_lengths=loss_cfg.get('win_lengths', [2048, 1024, 512]),
             stft_weight=loss_cfg.get('spectral_weight', 1.0),
-            mel_weight=loss_cfg.get('mel_weight', 25.0),  # High for GAN stability
+            mel_weight=loss_cfg.get('mel_weight', 45.0),  # VITS
             time_weight=loss_cfg.get('time_domain_weight', 0.1),
             phase_weight=loss_cfg.get('phase_weight', 2.0),
             amp_reg_weight=loss_cfg.get('amp_reg_weight', 0.01),
             pre_emp_weight=loss_cfg.get('pre_emp_weight', 10.0),
         ).to(device)
         
+        # Loss weights (VITS standard)
+        self.kl_weight = loss_cfg.get('kl_weight', 1.0)
         self.sparsity_weight = loss_cfg.get('sparsity_weight', 0.001)
-        self.fm_weight = gan_cfg.get('fm_weight', 10.0)
+        self.fm_weight = gan_cfg.get('fm_weight', 2.0)
         self.adv_weight = gan_cfg.get('adv_weight', 1.0)
         
         # ========== Optimizers ==========
@@ -201,20 +230,19 @@ class GANTrainer:
         self.g_optimizer = torch.optim.AdamW(self.generator.parameters(), lr=g_lr, betas=(0.8, 0.99))
         self.d_optimizer = torch.optim.AdamW(self.discriminator.parameters(), lr=d_lr, betas=(0.8, 0.99))
         
-        # ========== Schedulers ==========
-        warmup_steps = train_cfg.get('warmup_steps', 1000)
+        # Schedulers
+        warmup = train_cfg.get('warmup_steps', 1000)
         max_steps = train_cfg.get('max_steps', 100000)
         
-        g_warmup = LinearLR(self.g_optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-        g_cosine = CosineAnnealingLR(self.g_optimizer, T_max=max_steps - warmup_steps)
-        self.g_scheduler = SequentialLR(self.g_optimizer, [g_warmup, g_cosine], [warmup_steps])
+        g_warmup = LinearLR(self.g_optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup)
+        g_cosine = CosineAnnealingLR(self.g_optimizer, T_max=max_steps - warmup)
+        self.g_scheduler = SequentialLR(self.g_optimizer, [g_warmup, g_cosine], [warmup])
         
-        d_warmup = LinearLR(self.d_optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-        d_cosine = CosineAnnealingLR(self.d_optimizer, T_max=max_steps - warmup_steps)
-        self.d_scheduler = SequentialLR(self.d_optimizer, [d_warmup, d_cosine], [warmup_steps])
+        d_warmup = LinearLR(self.d_optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup)
+        d_cosine = CosineAnnealingLR(self.d_optimizer, T_max=max_steps - warmup)
+        self.d_scheduler = SequentialLR(self.d_optimizer, [d_warmup, d_cosine], [warmup])
         
         self.global_step = 0
-        self.warmup_freeze_steps = train_cfg.get('warmup_freeze_structure', 3000)
         
         if self.is_master:
             self.visualizer = Visualizer(str(output_dir / "visualizations"), sample_rate=self.sample_rate)
@@ -222,7 +250,7 @@ class GANTrainer:
             self.visualizer = None
         
         self.ref_audio = None
-        
+    
     def set_reference_sample(self, audio):
         self.ref_audio = audio.to(self.device)
     
@@ -243,7 +271,6 @@ class GANTrainer:
         return torch.stack(reconstructed, dim=0)
     
     def train_step(self, batch):
-        """Single GAN training step with D and G updates."""
         audio, lengths = batch
         audio = audio.to(self.device, non_blocking=True)
         num_samples = audio.shape[-1]
@@ -253,7 +280,6 @@ class GANTrainer:
         fake_audio = self.render_batch(enc_output, num_samples)
         
         # ========== Discriminator Step ==========
-        # D wants: real -> high, fake -> low
         self.d_optimizer.zero_grad()
         
         real_d_out, real_d_feats = self.discriminator(audio)
@@ -266,9 +292,8 @@ class GANTrainer:
         # ========== Generator Step ==========
         self.g_optimizer.zero_grad()
         
-        # Recompute fake through D (for gradients)
         fake_d_out_g, fake_d_feats_g = self.discriminator(fake_audio)
-        _, real_d_feats_g = self.discriminator(audio)  # For feature matching
+        _, real_d_feats_g = self.discriminator(audio)
         
         # Adversarial loss
         g_adv_loss = generator_loss(fake_d_out_g) * self.adv_weight
@@ -283,18 +308,15 @@ class GANTrainer:
             model_sigma=enc_output['sigma']
         )
         
-        # Sparsity loss (energy-based): sum of amplitude * existence_prob
+        # KL loss (VITS formula)
+        kl = kl_loss(enc_output['mu'], enc_output['logs']) * self.kl_weight
+        
+        # Sparsity loss (energy-based)
         energy_sparsity = (enc_output['amplitude'] * enc_output['existence_prob']).mean()
         sparsity_loss = self.sparsity_weight * energy_sparsity
         
         # Total G loss
-        g_loss = recon_loss + g_adv_loss + fm_loss + sparsity_loss
-        
-        # Structural warmup: freeze delta_tau/omega/sigma gradients
-        if self.global_step < self.warmup_freeze_steps:
-            # Zero out gradients for structural params by not stepping them
-            # This is approximate - we train but the frozen logic is in encoder
-            pass
+        g_loss = recon_loss + g_adv_loss + fm_loss + kl + sparsity_loss
         
         g_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
@@ -311,6 +333,7 @@ class GANTrainer:
             'g_loss': g_loss.item(),
             'd_loss': d_loss.item(),
             'recon_loss': recon_loss.item(),
+            'kl_loss': kl.item(),
             'adv_loss': g_adv_loss.item(),
             'fm_loss': fm_loss.item(),
             'sparsity_loss': sparsity_loss.item(),
@@ -323,6 +346,7 @@ class GANTrainer:
         self.generator.eval()
         
         total_loss = torch.tensor(0.0, device=self.device)
+        total_kl = torch.tensor(0.0, device=self.device)
         total_si_sdr = torch.tensor(0.0, device=self.device)
         total_active = torch.tensor(0.0, device=self.device)
         count = torch.tensor(0, device=self.device)
@@ -338,19 +362,19 @@ class GANTrainer:
             
             loss, _ = self.recon_loss_fn(fake, audio)
             total_loss += loss
+            total_kl += kl_loss(enc_output['mu'], enc_output['logs'])
             total_si_sdr += compute_si_sdr(fake, audio)
             total_active += (enc_output['existence_prob'] > 0.5).float().mean()
             count += 1
         
         if dist.is_initialized():
-            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total_si_sdr, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total_active, op=dist.ReduceOp.SUM)
-            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+            for t in [total_loss, total_kl, total_si_sdr, total_active, count]:
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
         
         cnt = count.item()
         results = {
             'val_loss': (total_loss / cnt).item() if cnt > 0 else 0.0,
+            'val_kl': (total_kl / cnt).item() if cnt > 0 else 0.0,
             'val_si_sdr': (total_si_sdr / cnt).item() if cnt > 0 else 0.0,
             'val_active_ratio': (total_active / cnt).item() if cnt > 0 else 0.0,
         }
@@ -428,9 +452,9 @@ def train(args, config):
         dist.barrier()
     
     if is_rank_zero() and args.use_wandb:
-        wandb.init(project="AudioGS-GAN", config=config, name=args.exp_name)
+        wandb.init(project="AudioGS-VAE", config=config, name=args.exp_name)
     
-    trainer = GANTrainer(config, device, rank, output_dir)
+    trainer = VAEGANTrainer(config, device, rank, output_dir)
     
     if args.resume:
         trainer.load_checkpoint(args.resume)
@@ -450,7 +474,7 @@ def train(args, config):
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist.is_initialized() else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist.is_initialized() else None
     
-    batch_size = config['training'].get('batch_size', 16)
+    batch_size = config['training'].get('batch_size', 4)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
                                sampler=train_sampler, num_workers=4, collate_fn=collate_fn,
                                pin_memory=True, drop_last=True)
@@ -469,10 +493,10 @@ def train(args, config):
     
     if is_rank_zero():
         print(f"\n{'='*60}")
-        print("AudioGS GAN Training")
+        print("AudioGS VAE-GAN Training")
         print(f"{'='*60}")
         print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, GPUs: {world_size}")
-        print(f"Max steps: {max_steps}")
+        print(f"Loss weights: mel={config['loss'].get('mel_weight', 45)}, kl={config['loss'].get('kl_weight', 1)}, fm={config['gan'].get('fm_weight', 2)}")
         print(f"{'='*60}\n")
     
     best_val_loss = float('inf')
@@ -480,7 +504,7 @@ def train(args, config):
     train_iter = iter(train_loader)
     
     if is_rank_zero():
-        pbar = tqdm(total=max_steps, initial=trainer.global_step, desc="GAN Training")
+        pbar = tqdm(total=max_steps, initial=trainer.global_step, desc="VAE-GAN Training")
     
     while trainer.global_step < max_steps:
         try:
@@ -497,9 +521,10 @@ def train(args, config):
         if is_rank_zero():
             pbar.update(1)
             pbar.set_postfix({
-                'G': f"{metrics['g_loss']:.3f}",
-                'D': f"{metrics['d_loss']:.3f}",
-                'act': f"{metrics['active_ratio']:.1%}",
+                'G': f"{metrics['g_loss']:.2f}",
+                'D': f"{metrics['d_loss']:.2f}",
+                'KL': f"{metrics['kl_loss']:.2f}",
+                'act': f"{metrics['active_ratio']:.0%}",
             })
             
             if args.use_wandb and trainer.global_step % log_interval == 0:
@@ -507,9 +532,9 @@ def train(args, config):
                     'train/g_loss': metrics['g_loss'],
                     'train/d_loss': metrics['d_loss'],
                     'train/recon_loss': metrics['recon_loss'],
+                    'train/kl_loss': metrics['kl_loss'],
                     'train/adv_loss': metrics['adv_loss'],
                     'train/fm_loss': metrics['fm_loss'],
-                    'train/sparsity_loss': metrics['sparsity_loss'],
                     'train/active_ratio': metrics['active_ratio'],
                     'train/lr': metrics['g_lr'],
                     'step': trainer.global_step,
@@ -519,9 +544,10 @@ def train(args, config):
             val_metrics = trainer.validate(val_loader)
             if is_rank_zero():
                 tqdm.write(f"\n[Val] Step {trainer.global_step}: "
-                          f"Loss={val_metrics['val_loss']:.4f}, "
-                          f"SI-SDR={val_metrics['val_si_sdr']:.2f}, "
-                          f"Active={val_metrics['val_active_ratio']:.1%}")
+                          f"Loss={val_metrics['val_loss']:.2f}, "
+                          f"KL={val_metrics['val_kl']:.2f}, "
+                          f"SI-SDR={val_metrics['val_si_sdr']:.1f}, "
+                          f"Active={val_metrics['val_active_ratio']:.0%}")
                 
                 if args.use_wandb:
                     wandb.log({f'val/{k}': v for k, v in val_metrics.items()}, step=trainer.global_step)
@@ -549,7 +575,7 @@ def train(args, config):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/AudioGS_config.yaml")
-    parser.add_argument("--exp_name", default="gan_v1")
+    parser.add_argument("--exp_name", default="vae_v1")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
