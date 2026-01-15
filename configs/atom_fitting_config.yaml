@@ -1,0 +1,38 @@
+# Stage 00: High-Quality Atom Fitting Config
+# ==========================================
+# Based on proven config that achieved high quality on 1s audio
+# Uses LibriTTS_R 24kHz
+
+# Data
+data:
+  dataset_path: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R"
+  sample_rate: 24000
+  max_audio_length: 10.0  # Full audio duration
+
+# Model
+model:
+  initial_num_atoms: 4096
+  max_num_atoms: 16384
+
+# Training (proven hyperparameters)
+training:
+  learning_rate: 0.001
+  lr_amplitude: 0.01820902986692016
+  lr_position: 0.00010418414874128424
+  lr_frequency: 0.0013375384144741348
+  lr_sigma: 0.014100480988103629
+  lr_phase: 0.011464829306470156
+  lr_chirp: 0.002
+  max_iters: 12000
+
+# Loss (proven configuration)
+loss:
+  fft_sizes: [2048, 1024, 512, 128]
+  hop_sizes: [512, 256, 128, 32]
+  win_lengths: [2048, 1024, 512, 128]
+  spectral_weight: 1.0
+  mel_weight: 0.5           # Lower than encoder config
+  time_domain_weight: 0.1
+  phase_weight: 0.8         # High for phase alignment
+  amp_reg_weight: 0.01      # Original value
+  pre_emp_weight: 20.0      # Higher pre-emphasis
