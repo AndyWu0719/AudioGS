@@ -75,7 +75,8 @@ class AudioGSModel(nn.Module):
             if use_f0_init:
                 omegas, phis = self._f0_guided_init(waveform_np, taus)
             else:
-                omegas, phis = self._stft_init(waveform, taus, n_fft, hop_length)
+                # Use robust STFT peak-picking as default (v2.0 fix)
+                omegas, phis = self._stft_peak_init(waveform, taus, n_fft, hop_length)
             
             # Assign to parameters
             self._tau.data = taus
@@ -272,8 +273,67 @@ class AudioGSModel(nn.Module):
         
         return omegas_tensor, phis_tensor
     
+    def _stft_peak_init(self, waveform: torch.Tensor, taus: torch.Tensor, n_fft: int = 2048, hop_length: int = 512):
+        """
+        Robust STFT Peak-Picking Initialization (v2.0).
+        
+        Unlike _stft_init which samples from magnitude distribution,
+        this method picks top-K spectral peaks per frame for more robust
+        initialization on polyphonic/noisy audio.
+        
+        Returns:
+            omegas: Frequency values in Hz for each atom
+            phis: Phase values for each atom
+        """
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        
+        # Compute STFT
+        stft = torch.stft(
+            waveform.squeeze(0), n_fft=n_fft, hop_length=hop_length,
+            return_complex=True, center=True,
+            window=torch.hann_window(n_fft).to(self.device)
+        )
+        # stft shape: [num_freq_bins, num_frames]
+        mag = stft.abs()
+        phase = stft.angle()
+        
+        num_freq_bins, num_frames = mag.shape
+        freqs = torch.linspace(0, self.nyquist_freq, num_freq_bins, device=self.device)
+        
+        num_atoms = len(taus)
+        
+        # Strategy: Distribute atoms across time frames
+        # For each atom at tau[i], find nearest frame and pick peak
+        frame_times = torch.arange(num_frames, device=self.device) * hop_length / self.sample_rate
+        
+        omegas = torch.zeros(num_atoms, device=self.device)
+        phis = torch.zeros(num_atoms, device=self.device)
+        
+        # Number of peaks to consider per frame
+        peaks_per_frame = min(10, num_freq_bins // 2)
+        
+        for i, tau in enumerate(taus):
+            # Find nearest frame
+            frame_idx = torch.argmin(torch.abs(frame_times - tau)).item()
+            frame_idx = max(0, min(frame_idx, num_frames - 1))
+            
+            # Get magnitude spectrum at this frame
+            frame_mag = mag[:, frame_idx]
+            
+            # Find top-K peaks (local maxima in frequency)
+            top_k_indices = torch.topk(frame_mag, k=peaks_per_frame).indices
+            
+            # Select one peak randomly from top-K (adds diversity)
+            selected_idx = top_k_indices[torch.randint(0, len(top_k_indices), (1,)).item()]
+            
+            omegas[i] = freqs[selected_idx]
+            phis[i] = phase[selected_idx, frame_idx]
+        
+        print(f"[STFT Peak Init] Initialized {num_atoms} atoms from spectral peaks")
+        return omegas, phis
+    
     def _stft_init(self, waveform: torch.Tensor, taus: torch.Tensor, n_fft: int, hop_length: int):
-        """Fallback STFT-based initialization."""
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
         

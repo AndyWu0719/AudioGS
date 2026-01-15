@@ -66,12 +66,21 @@ __global__ void gabor_forward_kernel(
         // Envelope
         const float envelope = expf(-t_sq / (2.0f * sigma_sq));
         
+        // NEW: Soft windowing with Hann taper to eliminate truncation artifacts
+        // Apply taper in outer 20% of window to ensure smooth transition to zero
+        const float normalized_dist = fabsf(t_centered) / window_bound;  // [0, 1]
+        float window_factor = 1.0f;
+        if (normalized_dist > 0.8f) {  // Outer 20% region
+            float edge_t = (normalized_dist - 0.8f) / 0.2f;  // Map to [0, 1]
+            window_factor = 0.5f * (1.0f + cosf(PI * edge_t));  // Hann taper
+        }
+        
         // Phase and carrier
         const float phase = TWO_PI * (omega_i * t_centered + 0.5f * gamma_i * t_sq) + phi_i;
         const float carrier = cosf(phase);
         
-        // Accumulate contribution using atomicAdd (thread-safe)
-        atomicAdd(&output[tid], A * envelope * carrier);
+        // Accumulate contribution with soft windowing (thread-safe)
+        atomicAdd(&output[tid], A * envelope * window_factor * carrier);
     }
 }
 

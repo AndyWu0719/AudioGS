@@ -60,7 +60,7 @@ class DensityController:
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
-        do_split: bool = True,
+        do_split: bool = False,  # DISABLED by default (v2.0 fix: prevents beating artifacts)
         do_clone: bool = True,
         do_prune: bool = True,
     ) -> Dict[str, int]:
