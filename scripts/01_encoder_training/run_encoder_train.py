@@ -202,21 +202,39 @@ class AutoencoderTrainer:
     def set_reference_sample(self, audio):
         self.ref_audio = audio.to(self.device)
     
-    def render_batch(self, enc_output, num_samples):
-        """Render Gabor atoms to waveform."""
+    def render_batch(self, enc_output, num_samples, prune_low_amp=False, amp_threshold=1e-4):
+        """Render Gabor atoms to waveform.
+        
+        Args:
+            enc_output: Encoder output dictionary
+            num_samples: Number of audio samples to render
+            prune_low_amp: If True, skip atoms with amplitude < amp_threshold (for inference speedup)
+            amp_threshold: Minimum amplitude to keep (default 1e-4)
+        """
         batch_size = enc_output['amplitude'].shape[0]
         reconstructed = []
+        
         for b in range(batch_size):
-            recon = self.renderer(
-                enc_output['amplitude'][b].contiguous(),
-                enc_output['tau'][b].contiguous(),
-                enc_output['omega'][b].contiguous(),
-                enc_output['sigma'][b].contiguous(),
-                enc_output['phi'][b].contiguous(),
-                enc_output['gamma'][b].contiguous(),
-                num_samples,
-            )
+            amp = enc_output['amplitude'][b].contiguous()
+            tau = enc_output['tau'][b].contiguous()
+            omega = enc_output['omega'][b].contiguous()
+            sigma = enc_output['sigma'][b].contiguous()
+            phi = enc_output['phi'][b].contiguous()
+            gamma = enc_output['gamma'][b].contiguous()
+            
+            # Inference pruning: skip low-amplitude atoms
+            if prune_low_amp:
+                mask = amp > amp_threshold
+                amp = amp[mask]
+                tau = tau[mask]
+                omega = omega[mask]
+                sigma = sigma[mask]
+                phi = phi[mask]
+                gamma = gamma[mask]
+            
+            recon = self.renderer(amp, tau, omega, sigma, phi, gamma, num_samples)
             reconstructed.append(recon)
+        
         return torch.stack(reconstructed, dim=0)
     
     def train_step(self, batch):

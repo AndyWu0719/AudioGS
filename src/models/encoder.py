@@ -337,18 +337,21 @@ class GaborGridEncoder(nn.Module):
         gamma_raw = grid[..., 6]
         
         # Apply activations
-        amplitude = F.softplus(amplitude_raw)  # Always positive, no masking
+        # Amplitude: softplus with clamp for numerical stability
+        amplitude = F.softplus(amplitude_raw).clamp(max=10.0)  # Prevent extreme values
         
         # Phase recovery from cos/sin with numerical stability
+        # Note: We output phi (scalar) for renderer, but Flow should predict cos/sin
         phase = torch.atan2(sin_phi_raw, cos_phi_raw + 1e-7)
         
         # Local offsets: Allow movement within ±1 cell
         delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec * 1.0)
         delta_omega = torch.tanh(delta_omega_raw) * (self.freq_bin_bandwidth * 1.0)
         
-        # Sigma: exp-based activation for smooth control, clamped to valid range
-        sigma_base = torch.exp(sigma_raw).clamp(min=self.sigma_min, max=self.sigma_max)
-        sigma = sigma_base
+        # Sigma: Use softplus for bounded, stable output (NOT exp which can explode)
+        # softplus(x - 2) + sigma_min gives range [sigma_min, ~inf) but bounded growth
+        sigma = F.softplus(sigma_raw - 2.0) * 0.02 + self.sigma_min
+        sigma = sigma.clamp(min=self.sigma_min, max=self.sigma_max)
         
         # Gamma (chirp): Reduced scale for stability (±100 Hz/s)
         gamma = torch.tanh(gamma_raw) * self.gamma_scale
@@ -379,14 +382,25 @@ class GaborGridEncoder(nn.Module):
         phi_flat = phase.view(batch_size, n_atoms)
         gamma_flat = gamma.view(batch_size, n_atoms)
         
-        # Pure continuous output - no existence mask
+        # Normalize cos/sin to unit vectors (for Flow Matching - continuous manifold)
+        cos_phi_norm = cos_phi_raw / (torch.sqrt(cos_phi_raw**2 + sin_phi_raw**2) + 1e-7)
+        sin_phi_norm = sin_phi_raw / (torch.sqrt(cos_phi_raw**2 + sin_phi_raw**2) + 1e-7)
+        cos_phi_flat = cos_phi_norm.view(batch_size, n_atoms)
+        sin_phi_flat = sin_phi_norm.view(batch_size, n_atoms)
+        
+        # Output: 6 params for Renderer, 8 params for Flow (with cos/sin instead of phi)
         result = {
+            # For Renderer (6 params)
             'amplitude': amplitude_flat,
             'tau': tau_flat,
             'omega': omega_flat,
             'sigma': sigma_flat,
-            'phi': phi_flat,
+            'phi': phi_flat,         # Scalar phase for renderer
             'gamma': gamma_flat,
+            # For Flow Matching (use these instead of phi - continuous manifold)
+            'cos_phi': cos_phi_flat,
+            'sin_phi': sin_phi_flat,
+            # Metadata
             'num_frames': num_frames,
             'atoms_per_frame': self.grid_freq_bins * self.atoms_per_cell,
         }
