@@ -221,8 +221,8 @@ class GaborGridEncoder(nn.Module):
                 # 1. Existence bias -> +2.0 (~88% active at start)
                 bias[:, :, 0].fill_(2.0)
                 
-                # 2. Amplitude bias -> -12.0 (Softplus(-12) ≈ 6e-6)
-                bias[:, :, 1].fill_(-12.0)
+                # 2. Amplitude bias -> -2.0 (Softplus(-2) ≈ 0.12)
+                bias[:, :, 1].fill_(-2.0)
                 
                 # 3. cos_phi/sin_phi: Initialize to random unit vectors
                 #    cos^2 + sin^2 = 1 helps the network learn proper phase representation
@@ -333,9 +333,11 @@ class GaborGridEncoder(nn.Module):
         # atan2(sin, cos) gives continuous phase in [-π, π] without wrapping issues
         phase = torch.atan2(sin_phi_raw, cos_phi_raw + 1e-7)
         
-        # Local offsets: Tanh scaled to half the cell size
-        delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec / 2)
-        delta_omega = torch.tanh(delta_omega_raw) * (self.freq_bin_bandwidth / 2)
+        # Local offsets: Allow atoms to cross grid lines (±2 cells)
+        # Tradeoff: Larger range = better coverage but potential overlap
+        # Alternative: Remove tanh and use soft regularization for unbounded movement
+        delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec * 2.0)
+        delta_omega = torch.tanh(delta_omega_raw) * (self.freq_bin_bandwidth * 2.0)
         
         # Sigma: Sigmoid mapped to [sigma_min, sigma_max]
         sigma = torch.sigmoid(sigma_raw) * (self.sigma_max - self.sigma_min) + self.sigma_min

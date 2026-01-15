@@ -272,11 +272,25 @@ class GANTrainer:
         # Render in FP32 (renderer requires FP32)
         fake_audio = self.render_batch(enc_output, num_samples)
         
+        # ========== NaN Protection: Check rendered audio ==========
+        if not torch.isfinite(fake_audio).all():
+            if self.is_master:
+                print(f"[Warning] Step {self.global_step}: NaN in fake_audio, skipping batch")
+            self.accum_count += 1
+            return self._nan_metrics()
+        
         # ========== Discriminator Step (AMP) ==========
         with torch.amp.autocast('cuda'):
             real_d_out, real_d_feats = self.discriminator(audio)
             fake_d_out, fake_d_feats = self.discriminator(fake_audio.detach())
             d_loss = discriminator_loss(real_d_out, fake_d_out) / self.accum_steps
+        
+        # Check D loss for NaN
+        if not torch.isfinite(d_loss):
+            if self.is_master:
+                print(f"[Warning] Step {self.global_step}: NaN in d_loss, skipping")
+            self.accum_count += 1
+            return self._nan_metrics()
         
         self.d_scaler.scale(d_loss).backward()
         
@@ -288,7 +302,6 @@ class GANTrainer:
             self.d_optimizer.zero_grad()
         
         # ========== Generator Step ==========
-        # Recompute fake through D with AMP
         with torch.amp.autocast('cuda'):
             fake_d_out_g, fake_d_feats_g = self.discriminator(fake_audio)
             _, real_d_feats_g = self.discriminator(audio)
@@ -311,6 +324,13 @@ class GANTrainer:
         # Total G loss (scale for accumulation)
         g_loss = (recon_loss + g_adv_loss.float() + fm_loss.float() + sparsity_loss) / self.accum_steps
         
+        # Check G loss for NaN
+        if not torch.isfinite(g_loss):
+            if self.is_master:
+                print(f"[Warning] Step {self.global_step}: NaN in g_loss, skipping")
+            self.accum_count += 1
+            return self._nan_metrics()
+        
         self.g_scaler.scale(g_loss).backward()
         
         if not is_accumulating:
@@ -322,8 +342,9 @@ class GANTrainer:
             
             self.g_scheduler.step()
             self.d_scheduler.step()
-            self.global_step += 1
         
+        # Always increment global_step for proper validation timing
+        self.global_step += 1
         self.accum_count += 1
         
         with torch.no_grad():
@@ -331,7 +352,7 @@ class GANTrainer:
             si_sdr = compute_si_sdr(fake_audio, audio).item()
         
         return {
-            'g_loss': g_loss.item() * self.accum_steps,  # Report unscaled loss
+            'g_loss': g_loss.item() * self.accum_steps,
             'd_loss': d_loss.item() * self.accum_steps,
             'recon_loss': recon_loss.item(),
             'mel_loss': loss_dict.get('mel', 0.0),
@@ -340,6 +361,16 @@ class GANTrainer:
             'fm_loss': fm_loss.item(),
             'sparsity_loss': sparsity_loss.item(),
             'active_ratio': active_ratio,
+            'g_lr': self.g_optimizer.param_groups[0]['lr'],
+        }
+    
+    def _nan_metrics(self):
+        """Return placeholder metrics when NaN is detected."""
+        return {
+            'g_loss': float('nan'), 'd_loss': float('nan'),
+            'recon_loss': float('nan'), 'mel_loss': 0.0, 'si_sdr': -100.0,
+            'adv_loss': float('nan'), 'fm_loss': float('nan'),
+            'sparsity_loss': float('nan'), 'active_ratio': 0.0,
             'g_lr': self.g_optimizer.param_groups[0]['lr'],
         }
     
