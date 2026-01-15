@@ -150,8 +150,9 @@ class GaborGridEncoder(nn.Module):
         self.time_hop_sec = time_downsample_factor / sample_rate  # 10ms
         self.nyquist = sample_rate / 2
         self.freq_bin_bandwidth = self.nyquist / grid_freq_bins
-        self.num_params = 8  # existence, amp, cos_phi, sin_phi, d_tau, d_omega, sigma, gamma
-        self.gamma_scale = 1000.0  # Chirp rate scaling (Hz/s)
+        # 7 params: amp, cos_phi, sin_phi, d_tau, d_omega, sigma, gamma (no existence)
+        self.num_params = 7
+        self.gamma_scale = 100.0  # Chirp rate scaling (Hz/s) - reduced for stability
         
         # Mel-Spectrogram transform
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
@@ -203,32 +204,43 @@ class GaborGridEncoder(nn.Module):
         """
         Initialize custom biases for the grid head.
         
-        1. Existence Logit (Index 0): Set to +2.0 (~88% active at start)
-        2. Amplitude (Index 1): Set to -12.0 (Softplus(-12) ≈ 6e-6, low energy)
-        3. cos_phi (Index 2) and sin_phi (Index 3): No special init needed
-           (network learns to produce unit-norm outputs)
+        Pure Autoencoder: No existence. Let amplitude learn to be zero for silence.
+        
+        1. Amplitude (Index 0): -2.0 (Softplus(-2) ≈ 0.13, reasonable start)
+        2. cos_phi (Index 1) and sin_phi (Index 2): Random unit vector
+        3. d_tau (Index 3): 0 (centered)
+        4. d_omega (Index 4): 0 (centered)
+        5. Sigma (Index 5): log(0.01) ≈ -4.6 (10ms wide atoms to catch gradients)
+        6. Gamma (Index 6): 0 (no chirp initially)
         """
+        import math
         final_layer = self.grid_head[-1]
         
         if final_layer.bias is not None:
             with torch.no_grad():
                 # Reshape bias to [F, A, P]
-                # P=8: [existence, amp, cos_phi, sin_phi, d_tau, d_omega, sigma, gamma]
+                # P=7: [amp, cos_phi, sin_phi, d_tau, d_omega, sigma, gamma]
                 bias = final_layer.bias.view(
                     self.grid_freq_bins, self.atoms_per_cell, self.num_params
                 )
                 
-                # 1. Existence bias -> 1.0 (~73% active at start, balanced)
-                bias[:, :, 0].fill_(1.0)
+                # 1. Amplitude bias -> -2.0 (Softplus(-2) ≈ 0.13)
+                bias[:, :, 0].fill_(-2.0)
                 
-                # 2. Amplitude bias -> -1.0 (Softplus(-1) ≈ 0.31, reasonable starting energy)
-                bias[:, :, 1].fill_(-1.0)
+                # 2. cos_phi/sin_phi: Random unit vectors
+                rand_phase = torch.rand_like(bias[:, :, 1]) * 2 * math.pi - math.pi
+                bias[:, :, 1] = torch.cos(rand_phase)  # cos_phi
+                bias[:, :, 2] = torch.sin(rand_phase)  # sin_phi
                 
-                # 3. cos_phi/sin_phi: Initialize to random unit vectors
-                #    cos^2 + sin^2 = 1 helps the network learn proper phase representation
-                rand_phase = torch.rand_like(bias[:, :, 2]) * 2 * math.pi - math.pi
-                bias[:, :, 2] = torch.cos(rand_phase)  # cos_phi
-                bias[:, :, 3] = torch.sin(rand_phase)  # sin_phi
+                # 3-4. d_tau, d_omega: centered at 0
+                bias[:, :, 3].fill_(0.0)  # d_tau
+                bias[:, :, 4].fill_(0.0)  # d_omega
+                
+                # 5. Sigma: log(0.01) ≈ -4.6 for ~10ms atoms
+                bias[:, :, 5].fill_(math.log(0.01))
+                
+                # 6. Gamma: 0 (no chirp)
+                bias[:, :, 6].fill_(0.0)
                 
                 # Flatten back
                 final_layer.bias.data = bias.view(-1)
@@ -313,76 +325,61 @@ class GaborGridEncoder(nn.Module):
         )
         
         # ============================
-        # 4. Parse parameters
+        # 4. Parse parameters (NO EXISTENCE - pure autoencoder)
         # ============================
-        # Indices: 0=existence, 1=amplitude, 2=cos_phi, 3=sin_phi, 4=d_tau, 5=d_omega, 6=sigma, 7=gamma
-        existence_logit = grid[..., 0]  # [B, T, F, A]
-        amplitude_raw = grid[..., 1]
-        cos_phi_raw = grid[..., 2]
-        sin_phi_raw = grid[..., 3]
-        delta_tau_raw = grid[..., 4]
-        delta_omega_raw = grid[..., 5]
-        sigma_raw = grid[..., 6]
-        gamma_raw = grid[..., 7]
+        # Indices: 0=amplitude, 1=cos_phi, 2=sin_phi, 3=d_tau, 4=d_omega, 5=sigma, 6=gamma
+        amplitude_raw = grid[..., 0]
+        cos_phi_raw = grid[..., 1]
+        sin_phi_raw = grid[..., 2]
+        delta_tau_raw = grid[..., 3]
+        delta_omega_raw = grid[..., 4]
+        sigma_raw = grid[..., 5]
+        gamma_raw = grid[..., 6]
         
         # Apply activations
-        existence_prob = torch.sigmoid(existence_logit)
-        amplitude = F.softplus(amplitude_raw)
+        amplitude = F.softplus(amplitude_raw)  # Always positive, no masking
         
-        # Phase recovery from cos/sin with numerical stability (epsilon prevents NaN gradients)
-        # atan2(sin, cos) gives continuous phase in [-π, π] without wrapping issues
+        # Phase recovery from cos/sin with numerical stability
         phase = torch.atan2(sin_phi_raw, cos_phi_raw + 1e-7)
         
-        # Local offsets: Allow movement within ±1 cell for better positioning
-        # Balanced: enough flexibility without gradient explosion (CUDA has soft clipping)
+        # Local offsets: Allow movement within ±1 cell
         delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec * 1.0)
         delta_omega = torch.tanh(delta_omega_raw) * (self.freq_bin_bandwidth * 1.0)
         
-        # Sigma: Use softplus with offset for smooth gradients (avoids small sigma explosion)
-        # P0 Fix: softplus(-2) ≈ 0.13, then scale to reasonable range
-        sigma_base = F.softplus(sigma_raw - 2.0) * 0.02 + self.sigma_min
-        sigma = torch.clamp(sigma_base, min=self.sigma_min, max=self.sigma_max)
+        # Sigma: exp-based activation for smooth control, clamped to valid range
+        sigma_base = torch.exp(sigma_raw).clamp(min=self.sigma_min, max=self.sigma_max)
+        sigma = sigma_base
         
-        # Gamma (chirp): Reduced scale for stability (±100 Hz/s instead of ±1000)
-        # P0 Fix: Most speech doesn't need aggressive chirp
-        gamma = torch.tanh(gamma_raw) * 100.0
+        # Gamma (chirp): Reduced scale for stability (±100 Hz/s)
+        gamma = torch.tanh(gamma_raw) * self.gamma_scale
         
         # ============================
         # 5. Grid-to-List conversion (differentiable)
         # ============================
-        # Create meshgrid for centers
         time_centers = self._compute_time_centers(num_frames, device)  # [T]
         freq_centers = self.freq_centers  # [F]
         
         # Expand to full grid shape [B, T, F, A]
-        # Time: [T] -> [1, T, 1, 1] -> broadcast to [B, T, F, A]
         tau_grid = time_centers.view(1, -1, 1, 1).expand(batch_size, -1, self.grid_freq_bins, self.atoms_per_cell)
-        # Freq: [F] -> [1, 1, F, 1] -> broadcast to [B, T, F, A]
         omega_grid = freq_centers.view(1, 1, -1, 1).expand(batch_size, num_frames, -1, self.atoms_per_cell)
         
         # Add offsets (differentiable)
         tau_final = tau_grid + delta_tau
         omega_final = omega_grid + delta_omega
         
-        # Apply existence mask to amplitude
-        existence_mask = existence_prob > self.existence_threshold
-        amplitude_masked = amplitude * existence_prob  # Soft masking for gradients
-        
         # ============================
         # 6. Flatten to [B, N_atoms]
         # ============================
         n_atoms = num_frames * self.grid_freq_bins * self.atoms_per_cell
         
-        amplitude_flat = amplitude_masked.view(batch_size, n_atoms)
+        amplitude_flat = amplitude.view(batch_size, n_atoms)
         tau_flat = tau_final.view(batch_size, n_atoms)
         omega_flat = omega_final.view(batch_size, n_atoms)
         sigma_flat = sigma.view(batch_size, n_atoms)
         phi_flat = phase.view(batch_size, n_atoms)
-        gamma_flat = gamma.view(batch_size, n_atoms)  # Predicted chirp
+        gamma_flat = gamma.view(batch_size, n_atoms)
         
-        existence_mask_flat = existence_mask.view(batch_size, n_atoms)
-        existence_prob_flat = existence_prob.view(batch_size, n_atoms)
-        
+        # Pure continuous output - no existence mask
         result = {
             'amplitude': amplitude_flat,
             'tau': tau_flat,
@@ -390,8 +387,6 @@ class GaborGridEncoder(nn.Module):
             'sigma': sigma_flat,
             'phi': phi_flat,
             'gamma': gamma_flat,
-            'existence_mask': existence_mask_flat,
-            'existence_prob': existence_prob_flat,
             'num_frames': num_frames,
             'atoms_per_frame': self.grid_freq_bins * self.atoms_per_cell,
         }

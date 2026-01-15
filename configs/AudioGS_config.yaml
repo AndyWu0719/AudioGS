@@ -1,4 +1,4 @@
-# AudioGS Configuration: Amortized Inference (Encoder-Based) + GAN Training
+# AudioGS Configuration: Pure Autoencoder (STFT Reconstruction)
 # =========================================================
 
 # Data
@@ -7,7 +7,7 @@ data:
   sample_rate: 24000
   subsets: ["train-clean-100", "train-clean-360"]
   val_subsets: ["dev-clean"]
-  max_audio_length: 3.0      # Reduced from 10.0 for memory efficiency
+  max_audio_length: 3.0      # 3 seconds for memory efficiency
 
 # Encoder Model
 encoder_model:
@@ -20,42 +20,29 @@ encoder_model:
   use_conformer: true
   use_checkpointing: true  # Gradient checkpointing for memory savings
 
-# Training (Step-Based)
+# Training (Pure Autoencoder - No GAN)
 training:
-  # Phase 1 (no D): larger batch for better gradient estimation
-  batch_size_phase1: 8
-  # Phase 2 (with D): reduced batch due to D memory
-  batch_size_phase2: 2
-  accumulation_steps: 32       # Adjust to keep effective batch ~64
-  learning_rate: 0.0002       # G learning rate (AdamW)
+  batch_size: 32              # Single batch size (no phase switching)
+  accumulation_steps: 8      # Effective batch = 8*8*4GPUs = 256
+  learning_rate: 0.0002      # AdamW
   max_steps: 100000
   warmup_steps: 1000
-  warmup_freeze_structure: 5000
   val_interval: 2000
   save_interval: 10000
   log_interval: 10
 
-# GAN Training
-gan:
-  enable: true
-  d_lr: 0.0002              # Discriminator learning rate
-  fm_weight: 10.0           # Feature matching loss weight
-  adv_weight: 1.0           # Adversarial loss weight
-  warmup_steps: 5000       # Extended Phase 1 for better pre-training
-
-# Loss (Rebalanced for staged training)
+# Loss (Multi-Scale STFT Reconstruction)
 loss:
   fft_sizes: [2048, 1024, 512, 128]
   hop_sizes: [512, 256, 128, 32]
   win_lengths: [2048, 1024, 512, 128]
-  spectral_weight: 1.0
-  mel_weight: 45.0          # High for strong reconstruction signal
-  time_domain_weight: 0.1
-  phase_weight: 2.0
-  sparsity_weight: 0.1      # Increased for Target Ratio mechanism
-  target_active_ratio: 0.25 # Target 25% active atoms (over-complete)
-  amp_reg_weight: 0.01
-  pre_emp_weight: 2.0       # Reduced to avoid over-penalizing high freq
+  spectral_weight: 1.0       # Multi-scale STFT
+  mel_weight: 45.0           # Strong mel reconstruction
+  time_domain_weight: 0.1    # Light time-domain L1
+  phase_weight: 2.0          # Phase-aware loss
+  amp_l1_weight: 0.0001      # Very light amplitude L1 (natural sparsity)
+  amp_reg_weight: 0.0        # Disabled (use amp_l1_weight instead)
+  pre_emp_weight: 2.0        # Pre-emphasis for high-frequency detail
 
 # Distributed Training
 distributed:
