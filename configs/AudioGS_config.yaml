@@ -7,7 +7,7 @@ data:
   sample_rate: 24000
   subsets: ["train-clean-100", "train-clean-360"]
   val_subsets: ["dev-clean"]
-  max_audio_length: 10.0
+  max_audio_length: 3.0      # Reduced from 10.0 for memory efficiency
 
 # Encoder Model
 encoder_model:
@@ -20,14 +20,17 @@ encoder_model:
   use_conformer: true
   use_checkpointing: true  # Gradient checkpointing for memory savings
 
-# Training (Step-Based with AMP)
+# Training (Step-Based)
 training:
-  batch_size: 4
-  accumulation_steps: 8     # Effective batch = 4*8*4GPUs = 128
-  learning_rate: 0.0002     # G learning rate (AdamW)
+  # Phase 1 (no D): larger batch for better gradient estimation
+  batch_size_phase1: 8
+  # Phase 2 (with D): reduced batch due to D memory
+  batch_size_phase2: 2
+  accumulation_steps: 32       # Adjust to keep effective batch ~64
+  learning_rate: 0.0002       # G learning rate (AdamW)
   max_steps: 100000
   warmup_steps: 1000
-  warmup_freeze_structure: 2000
+  warmup_freeze_structure: 5000
   val_interval: 2000
   save_interval: 10000
   log_interval: 10
@@ -38,19 +41,21 @@ gan:
   d_lr: 0.0002              # Discriminator learning rate
   fm_weight: 10.0           # Feature matching loss weight
   adv_weight: 1.0           # Adversarial loss weight
+  warmup_steps: 5000       # Extended Phase 1 for better pre-training
 
-# Loss (Rebalanced for GAN training)
+# Loss (Rebalanced for staged training)
 loss:
   fft_sizes: [2048, 1024, 512, 128]
   hop_sizes: [512, 256, 128, 32]
   win_lengths: [2048, 1024, 512, 128]
   spectral_weight: 1.0
-  mel_weight: 25.0          # High for GAN stability
+  mel_weight: 45.0          # High for strong reconstruction signal
   time_domain_weight: 0.1
   phase_weight: 2.0
-  sparsity_weight: 0.001
+  sparsity_weight: 0.1      # Increased for Target Ratio mechanism
+  target_active_ratio: 0.25 # Target 25% active atoms (over-complete)
   amp_reg_weight: 0.01
-  pre_emp_weight: 10.0
+  pre_emp_weight: 2.0       # Reduced to avoid over-penalizing high freq
 
 # Distributed Training
 distributed:

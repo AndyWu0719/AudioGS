@@ -249,9 +249,12 @@ def discriminator_loss(
     Hinge loss for discriminator.
     D wants: real -> 1, fake -> -1
     """
-    loss = 0
+    loss = torch.tensor(0.0, device=real_outputs[0].device)
     for real, fake in zip(real_outputs, fake_outputs):
-        loss += torch.mean(F.relu(1 - real)) + torch.mean(F.relu(1 + fake))
+        # Clamp outputs to prevent extreme values
+        real_clamped = real.clamp(-100, 100)
+        fake_clamped = fake.clamp(-100, 100)
+        loss = loss + torch.mean(F.relu(1 - real_clamped)) + torch.mean(F.relu(1 + fake_clamped))
     return loss
 
 
@@ -260,9 +263,11 @@ def generator_loss(fake_outputs: List[torch.Tensor]) -> torch.Tensor:
     Hinge loss for generator.
     G wants: fake -> 1
     """
-    loss = 0
+    loss = torch.tensor(0.0, device=fake_outputs[0].device)
     for fake in fake_outputs:
-        loss += torch.mean(F.relu(1 - fake))
+        # Clamp outputs to prevent extreme values
+        fake_clamped = fake.clamp(-100, 100)
+        loss = loss + torch.mean(F.relu(1 - fake_clamped))
     return loss
 
 

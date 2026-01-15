@@ -218,11 +218,11 @@ class GaborGridEncoder(nn.Module):
                     self.grid_freq_bins, self.atoms_per_cell, self.num_params
                 )
                 
-                # 1. Existence bias -> 0.0 (~50% active at start, more conservative)
-                bias[:, :, 0].fill_(0.0)
+                # 1. Existence bias -> 1.0 (~73% active at start, balanced)
+                bias[:, :, 0].fill_(1.0)
                 
-                # 2. Amplitude bias -> -3.0 (Softplus(-3) ≈ 0.05, lower initial energy)
-                bias[:, :, 1].fill_(-3.0)
+                # 2. Amplitude bias -> -1.0 (Softplus(-1) ≈ 0.31, reasonable starting energy)
+                bias[:, :, 1].fill_(-1.0)
                 
                 # 3. cos_phi/sin_phi: Initialize to random unit vectors
                 #    cos^2 + sin^2 = 1 helps the network learn proper phase representation
@@ -333,10 +333,10 @@ class GaborGridEncoder(nn.Module):
         # atan2(sin, cos) gives continuous phase in [-π, π] without wrapping issues
         phase = torch.atan2(sin_phi_raw, cos_phi_raw + 1e-7)
         
-        # Local offsets: Conservative ranges to prevent gradient explosion
-        # P0 Fix: Reduced from ±2 cells to ±0.5 cells to limit gradient magnification
-        delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec * 0.5)
-        delta_omega = torch.tanh(delta_omega_raw) * (self.freq_bin_bandwidth * 0.5)
+        # Local offsets: Allow movement within ±1 cell for better positioning
+        # Balanced: enough flexibility without gradient explosion (CUDA has soft clipping)
+        delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec * 1.0)
+        delta_omega = torch.tanh(delta_omega_raw) * (self.freq_bin_bandwidth * 1.0)
         
         # Sigma: Use softplus with offset for smooth gradients (avoids small sigma explosion)
         # P0 Fix: softplus(-2) ≈ 0.13, then scale to reasonable range
