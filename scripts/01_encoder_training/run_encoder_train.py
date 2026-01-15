@@ -68,8 +68,9 @@ def kl_loss(mu: torch.Tensor, logs: torch.Tensor) -> torch.Tensor:
     VITS formula: -0.5 * sum(1 + 2*logs - mu^2 - exp(2*logs))
     Clamp logs to prevent numerical explosion.
     """
-    # Clamp log_sigma to prevent exp explosion
-    logs = torch.clamp(logs, min=-10.0, max=10.0)
+    # [FIX] Clamp log_sigma to prevent exp() overflow
+    # max=5 because exp(2*5) = exp(10) ≈ 22000, still safe
+    logs = torch.clamp(logs, min=-20.0, max=5.0)
     kl = -0.5 * torch.sum(1 + 2*logs - mu**2 - torch.exp(2*logs), dim=[1, 2])
     return kl.mean()
 
@@ -228,6 +229,8 @@ class VAEGANTrainer:
         self.sparsity_weight = loss_cfg.get('sparsity_weight', 0.001)
         self.fm_weight = gan_cfg.get('fm_weight', 2.0)
         self.adv_weight = gan_cfg.get('adv_weight', 1.0)
+        self.gan_warmup_steps = gan_cfg.get('warmup_steps', 5000)
+        self.accum_steps = train_cfg.get('accumulation_steps', 1)
         
         # ========== Optimizers ==========
         g_lr = float(train_cfg.get('learning_rate', 2e-4))
@@ -324,10 +327,17 @@ class VAEGANTrainer:
     def train_step(self, batch):
         audio, lengths = batch
         audio = audio.to(self.device, non_blocking=True)
+        
+        # [FIX] Immediate check for bad input data
+        if not torch.isfinite(audio).all():
+            print(f"[Warning] Step {self.global_step}: Input audio contains NaN/Inf! Skipping.")
+            return None
+            
         num_samples = audio.shape[-1]
         
-        # ========== Generator Forward (AMP) ==========
-        with torch.amp.autocast('cuda'):
+        # ========== Generator Forward (FP32) ==========
+        # [FIX] Disable AMP for Generator to prevent Conformer attention overflow
+        with torch.amp.autocast('cuda', enabled=False):
             enc_output = self.generator(audio)
         
         # Debug: Check for NaN in encoder outputs
@@ -345,30 +355,46 @@ class VAEGANTrainer:
                 print(f"[NaN Debug] Step {self.global_step}: NaN in fake_audio after render")
         
         # ========== Discriminator Step ==========
-        self.d_optimizer.zero_grad()
-        
-        with torch.amp.autocast('cuda'):
-            real_d_out, real_d_feats = self.discriminator(audio)
-            fake_d_out, fake_d_feats = self.discriminator(fake_audio.detach())
-            d_loss = discriminator_loss(real_d_out, fake_d_out)
-        
-        # Track scale before step to check if step was skipped
-        d_scale_before = self.d_scaler.get_scale()
-        self.d_scaler.scale(d_loss).backward()
-        self.d_scaler.unscale_(self.d_optimizer)
-        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)  # D grad clip
-        self.d_scaler.step(self.d_optimizer)
-        self.d_scaler.update()
+        # Only train Discriminator after warmup
+        if self.global_step >= self.gan_warmup_steps:
+            self.d_optimizer.zero_grad()
+            
+            with torch.amp.autocast('cuda'):
+                real_d_out, real_d_feats = self.discriminator(audio)
+                fake_d_out, fake_d_feats = self.discriminator(fake_audio.detach())
+                d_loss = discriminator_loss(real_d_out, fake_d_out)
+            
+            # Track scale before step to check if step was skipped
+            d_scale_before = self.d_scaler.get_scale()
+            
+            # Gradient Accumulation for D
+            d_loss = d_loss / self.accum_steps
+            self.d_scaler.scale(d_loss).backward()
+            
+            if (self.global_step + 1) % self.accum_steps == 0:
+                self.d_scaler.unscale_(self.d_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+                self.d_scaler.step(self.d_optimizer)
+                self.d_scaler.update()
+        else:
+            d_loss = torch.tensor(0.0, device=self.device)
+            d_scale_before = 0 # No step
         
         # ========== Generator Step ==========
-        self.g_optimizer.zero_grad()
+        if self.accum_steps == 1 or (self.global_step + 1) % self.accum_steps == 1:
+            self.g_optimizer.zero_grad() # Zero grad at start of accumulation cycle
         
         with torch.amp.autocast('cuda'):
-            fake_d_out_g, fake_d_feats_g = self.discriminator(fake_audio)
-            _, real_d_feats_g = self.discriminator(audio)
-            
-            g_adv_loss = generator_loss(fake_d_out_g) * self.adv_weight
-            fm_loss = feature_matching_loss(real_d_feats_g, fake_d_feats_g) * self.fm_weight
+            # Only compute GAN losses after warmup
+            if self.global_step >= self.gan_warmup_steps:
+                fake_d_out_g, fake_d_feats_g = self.discriminator(fake_audio)
+                _, real_d_feats_g = self.discriminator(audio)
+                
+                g_adv_loss = generator_loss(fake_d_out_g) * self.adv_weight
+                fm_loss = feature_matching_loss(real_d_feats_g, fake_d_feats_g) * self.fm_weight
+            else:
+                g_adv_loss = torch.tensor(0.0, device=self.device)
+                fm_loss = torch.tensor(0.0, device=self.device)
         
         # Loss calculation in FP32 (disabled autocast)
         with torch.amp.autocast('cuda', enabled=False):
@@ -399,17 +425,24 @@ class VAEGANTrainer:
         
         # Track scale before step to check if step was skipped
         g_scale_before = self.g_scaler.get_scale()
-        self.g_scaler.scale(g_loss).backward()
-        self.g_scaler.unscale_(self.g_optimizer)
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-        self.g_scaler.step(self.g_optimizer)
-        self.g_scaler.update()
         
-        # Only step scheduler if optimizer actually stepped (scale didn't decrease)
-        if self.g_scaler.get_scale() >= g_scale_before:
-            self.g_scheduler.step()
-        if self.d_scaler.get_scale() >= d_scale_before:
-            self.d_scheduler.step()
+        # Gradient Accumulation for G
+        g_loss = g_loss / self.accum_steps
+        self.g_scaler.scale(g_loss).backward()
+        
+        if (self.global_step + 1) % self.accum_steps == 0:
+            self.g_scaler.unscale_(self.g_optimizer)
+            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+            self.g_scaler.step(self.g_optimizer)
+            self.g_scaler.update()
+        
+            # Only step scheduler if optimizer actually stepped (scale didn't decrease)
+            if self.g_scaler.get_scale() >= g_scale_before:
+                self.g_scheduler.step()
+            
+            # Only step D scheduler if trained and stepped
+            if self.global_step >= self.gan_warmup_steps and self.d_scaler.get_scale() >= d_scale_before:
+                self.d_scheduler.step()
         
         self.global_step += 1
         
@@ -616,6 +649,10 @@ def train(args, config):
         
         metrics = trainer.train_step(batch)
         
+        # Skip iteration if training step failed (returned None)
+        if metrics is None:
+            continue
+            
         if is_rank_zero():
             pbar.update(1)
             # Enhanced logging with Mel and FM
