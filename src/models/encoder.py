@@ -289,9 +289,12 @@ class GaborVAEEncoder(nn.Module):
         # Downsample
         x = self.downsample(x)  # [B, C, T_latent]
         
-        # VAE projections
+        # VAE projections with clamping for stability
         mu = self.mu_proj(x)
         logs = self.logs_proj(x)
+        
+        # Clamp logs to prevent exp explosion (critical for stability)
+        logs = torch.clamp(logs, min=-10.0, max=2.0)
         
         # Sample
         z = self.reparameterize(mu, logs)
@@ -341,9 +344,15 @@ class GaborVAEEncoder(nn.Module):
         sigma_raw = grid[..., 6]
         gamma_raw = grid[..., 7]
         
-        # Activations
+        # Activations with clamping for numerical stability
         existence_prob = torch.sigmoid(existence_logit)
+        
+        # Clamp amplitude_raw before softplus to prevent overflow
+        amplitude_raw = torch.clamp(amplitude_raw, min=-20.0, max=10.0)
         amplitude = F.softplus(amplitude_raw)
+        amplitude = torch.clamp(amplitude, max=100.0)  # Hard limit on amplitude
+        
+        # Phase with stability
         phase = torch.atan2(sin_phi_raw, cos_phi_raw + 1e-7)
         
         delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec / 2)

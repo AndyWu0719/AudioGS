@@ -66,7 +66,10 @@ def kl_loss(mu: torch.Tensor, logs: torch.Tensor) -> torch.Tensor:
     """
     KL divergence: KL(q(z|x) || p(z)) where p(z) = N(0, 1)
     VITS formula: -0.5 * sum(1 + 2*logs - mu^2 - exp(2*logs))
+    Clamp logs to prevent numerical explosion.
     """
+    # Clamp log_sigma to prevent exp explosion
+    logs = torch.clamp(logs, min=-10.0, max=10.0)
     kl = -0.5 * torch.sum(1 + 2*logs - mu**2 - torch.exp(2*logs), dim=[1, 2])
     return kl.mean()
 
@@ -262,20 +265,59 @@ class VAEGANTrainer:
         self.ref_audio = audio.to(self.device)
     
     def render_batch(self, enc_output, num_samples):
-        """Render with FP32 (critical for stability)."""
+        """
+        Render with FP32 and safe parameter clamping.
+        
+        CRITICAL: The CUDA renderer can produce NaN for extreme parameter values.
+        We clamp all inputs to safe ranges before rendering.
+        """
         enc_fp32 = cast_to_fp32(enc_output)
         batch_size = enc_fp32['amplitude'].shape[0]
+        
+        # Safe parameter ranges for CUDA renderer
+        # Replace NaN/Inf with safe defaults, clamp to valid ranges
+        amplitude = enc_fp32['amplitude']
+        tau = enc_fp32['tau']
+        omega = enc_fp32['omega']
+        sigma = enc_fp32['sigma']
+        phi = enc_fp32['phi']
+        gamma = enc_fp32['gamma']
+        
+        # Replace NaN/Inf with zeros for amplitude (silent)
+        amplitude = torch.where(torch.isfinite(amplitude), amplitude, torch.zeros_like(amplitude))
+        amplitude = torch.clamp(amplitude, min=0.0, max=100.0)
+        
+        # Clamp time to valid audio range
+        audio_duration = num_samples / self.sample_rate
+        tau = torch.clamp(tau, min=0.0, max=audio_duration)
+        tau = torch.where(torch.isfinite(tau), tau, torch.full_like(tau, audio_duration / 2))
+        
+        # Clamp frequency to valid range (must be > 0)
+        omega = torch.clamp(omega, min=20.0, max=self.sample_rate / 2 - 10)
+        omega = torch.where(torch.isfinite(omega), omega, torch.full_like(omega, 1000.0))
+        
+        # Clamp sigma (bandwidth) to safe range
+        sigma = torch.clamp(sigma, min=0.001, max=0.1)
+        sigma = torch.where(torch.isfinite(sigma), sigma, torch.full_like(sigma, 0.02))
+        
+        # Replace NaN in phase/gamma
+        phi = torch.where(torch.isfinite(phi), phi, torch.zeros_like(phi))
+        gamma = torch.where(torch.isfinite(gamma), gamma, torch.zeros_like(gamma))
+        gamma = torch.clamp(gamma, min=-1000.0, max=1000.0)
+        
         reconstructed = []
         for b in range(batch_size):
             recon = self.renderer(
-                enc_fp32['amplitude'][b].contiguous(),
-                enc_fp32['tau'][b].contiguous(),
-                enc_fp32['omega'][b].contiguous(),
-                enc_fp32['sigma'][b].contiguous(),
-                enc_fp32['phi'][b].contiguous(),
-                enc_fp32['gamma'][b].contiguous(),
+                amplitude[b].contiguous(),
+                tau[b].contiguous(),
+                omega[b].contiguous(),
+                sigma[b].contiguous(),
+                phi[b].contiguous(),
+                gamma[b].contiguous(),
                 num_samples,
             )
+            # Safety: clamp output audio
+            recon = torch.clamp(recon, min=-10.0, max=10.0)
             reconstructed.append(recon)
         return torch.stack(reconstructed, dim=0)
     
@@ -288,8 +330,19 @@ class VAEGANTrainer:
         with torch.amp.autocast('cuda'):
             enc_output = self.generator(audio)
         
+        # Debug: Check for NaN in encoder outputs
+        if self.global_step < 100 or self.global_step % 100 == 0:
+            for k, v in enc_output.items():
+                if torch.is_tensor(v) and not torch.isfinite(v).all():
+                    print(f"[NaN Debug] Step {self.global_step}: NaN in enc_output['{k}']")
+        
         # Render in FP32 (critical!)
         fake_audio = self.render_batch(enc_output, num_samples)
+        
+        # Debug: Check for NaN in rendered audio
+        if not torch.isfinite(fake_audio).all():
+            if self.global_step < 100 or self.global_step % 100 == 0:
+                print(f"[NaN Debug] Step {self.global_step}: NaN in fake_audio after render")
         
         # ========== Discriminator Step ==========
         self.d_optimizer.zero_grad()
@@ -302,6 +355,8 @@ class VAEGANTrainer:
         # Track scale before step to check if step was skipped
         d_scale_before = self.d_scaler.get_scale()
         self.d_scaler.scale(d_loss).backward()
+        self.d_scaler.unscale_(self.d_optimizer)
+        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)  # D grad clip
         self.d_scaler.step(self.d_optimizer)
         self.d_scaler.update()
         
@@ -324,10 +379,23 @@ class VAEGANTrainer:
                 model_sigma=enc_fp32['sigma']
             )
             
-            kl = kl_loss(enc_fp32['mu'], enc_fp32['logs']) * self.kl_weight
-            sparsity = (enc_fp32['amplitude'] * enc_fp32['existence_prob']).mean() * self.sparsity_weight
+        # KL annealing: ramp up KL weight during first 5k steps
+        kl_anneal = min(1.0, self.global_step / 5000.0)
+        kl = kl_loss(enc_fp32['mu'], enc_fp32['logs']) * self.kl_weight * kl_anneal
+        sparsity = (enc_fp32['amplitude'] * enc_fp32['existence_prob']).mean() * self.sparsity_weight
         
         g_loss = recon_loss + g_adv_loss.float() + fm_loss.float() + kl + sparsity
+        
+        # Check for NaN and skip step if detected
+        if not torch.isfinite(g_loss):
+            print(f"[Warning] Step {self.global_step}: NaN/Inf in g_loss, skipping update")
+            self.global_step += 1
+            return {
+                'g_loss': float('nan'), 'd_loss': d_loss.item(),
+                'recon_loss': float('nan'), 'mel_loss': 0.0, 'kl_loss': float('nan'),
+                'adv_loss': float('nan'), 'fm_loss': float('nan'), 'sparsity_loss': float('nan'),
+                'active_ratio': 0.0, 'g_lr': self.g_optimizer.param_groups[0]['lr'],
+            }
         
         # Track scale before step to check if step was skipped
         g_scale_before = self.g_scaler.get_scale()
@@ -404,10 +472,14 @@ class VAEGANTrainer:
             enc_out = self.generator(ref_in)
             recon = self.render_batch(enc_out, ref_in.shape[-1])[0]
             
-            step_str = f"step_{self.global_step:06d}"
-            self.visualizer.save_audio(recon, f"{step_str}_recon")
-            self.visualizer.plot_spectrogram_comparison(self.ref_audio, recon, f"{step_str}_spec",
-                                                         title=f"Step {self.global_step}")
+            # Check for NaN/Inf before visualization (training may have diverged)
+            if torch.isfinite(recon).all():
+                step_str = f"step_{self.global_step:06d}"
+                self.visualizer.save_audio(recon, f"{step_str}_recon")
+                self.visualizer.plot_spectrogram_comparison(self.ref_audio, recon, f"{step_str}_spec",
+                                                             title=f"Step {self.global_step}")
+            else:
+                print(f"[Warning] Skipping visualization at step {self.global_step}: audio contains NaN/Inf")
         
         self.generator.train()
         return results
