@@ -22,8 +22,8 @@ encoder_model:
 
 # Training (Step-Based)
 training:
-  batch_size: 8             # Small batch for VAE+GAN
-  accumulation_steps: 4     # Gradient accumulation
+  batch_size: 16             # Small batch for VAE+GAN
+  accumulation_steps: 2     # Gradient accumulation
   num_workers: 8
   learning_rate: 0.0002     # G learning rate
   max_steps: 100000
@@ -38,7 +38,7 @@ gan:
   d_lr: 0.0001            # Reduced from 2e-4 for stability
   fm_weight: 0.5          # Reduced from 2.0 to prevent early explosion
   adv_weight: 1.0           # VITS standard
-  warmup_steps: 5000      # Do not train D for first 5k steps
+  warmup_steps: 2000      # Do not train D for first 5k steps
 
 # Loss (VITS Standard Configuration)
 loss:

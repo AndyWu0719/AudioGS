@@ -470,7 +470,10 @@ class VAEGANTrainer:
         total_kl = torch.tensor(0.0, device=self.device)
         total_si_sdr = torch.tensor(0.0, device=self.device)
         total_active = torch.tensor(0.0, device=self.device)
+        total_mel = torch.tensor(0.0, device=self.device)
+        total_pesq = torch.tensor(0.0, device=self.device)
         count = torch.tensor(0, device=self.device)
+        pesq_count = torch.tensor(0, device=self.device)
         
         for i, batch in enumerate(val_loader):
             if i >= max_batches:
@@ -478,26 +481,64 @@ class VAEGANTrainer:
             audio, _ = batch
             audio = audio.to(self.device)
             
-            enc_output = self.generator(audio)
+            # Use FP32 (no autocast)
+            with torch.amp.autocast('cuda', enabled=False):
+                enc_output = self.generator(audio)
             fake = self.render_batch(enc_output, audio.shape[-1])
             
-            loss, _ = self.recon_loss_fn(fake, audio)
+            loss, loss_dict = self.recon_loss_fn(fake, audio)
+            
             total_loss += loss
+            total_mel += loss_dict.get('mel', 0.0)
             total_kl += kl_loss(enc_output['mu'].float(), enc_output['logs'].float())
             total_si_sdr += compute_si_sdr(fake, audio)
             total_active += (enc_output['existence_prob'] > 0.5).float().mean()
+            
+            # Compute PESQ (CPU only, slow)
+            # Compute PESQ (CPU only, slow)
+            if PESQ_AVAILABLE:
+                try:
+                    p_score = 0.0
+                    for j in range(audio.shape[0]):
+                        ref_t = audio[j].detach().cpu()
+                        deg_t = fake[j].detach().cpu().float()
+                        
+                        # Resample to 16k for WB-PESQ if needed
+                        if self.sample_rate != 16000:
+                            resampler = torchaudio.transforms.Resample(self.sample_rate, 16000)
+                            ref_t = resampler(ref_t)
+                            deg_t = resampler(deg_t)
+                            target_sr = 16000
+                        else:
+                            target_sr = self.sample_rate
+
+                        ref_np = ref_t.numpy().squeeze()
+                        deg_np = deg_t.numpy().squeeze()
+                        p_score += pesq(target_sr, ref_np, deg_np, 'wb')
+                    total_pesq += p_score
+                    pesq_count += audio.shape[0]
+                except Exception as e:
+                    pass
+            
             count += 1
         
         if dist.is_initialized():
-            for t in [total_loss, total_kl, total_si_sdr, total_active, count]:
+            for t in [total_loss, total_kl, total_si_sdr, total_active, total_mel, count]:
                 dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            if PESQ_AVAILABLE:
+                dist.all_reduce(total_pesq, op=dist.ReduceOp.SUM)
+                dist.all_reduce(pesq_count, op=dist.ReduceOp.SUM)
         
         cnt = count.item()
+        p_cnt = pesq_count.item() if PESQ_AVAILABLE else 0
+        
         results = {
             'val_loss': (total_loss / cnt).item() if cnt > 0 else 0.0,
+            'val_mel': (total_mel / cnt).item() if cnt > 0 else 0.0,
             'val_kl': (total_kl / cnt).item() if cnt > 0 else 0.0,
             'val_si_sdr': (total_si_sdr / cnt).item() if cnt > 0 else 0.0,
             'val_active_ratio': (total_active / cnt).item() if cnt > 0 else 0.0,
+            'val_pesq': (total_pesq / p_cnt).item() if p_cnt > 0 else 0.0,
         }
         
         if self.is_master and self.ref_audio is not None and self.visualizer:
@@ -682,10 +723,14 @@ def train(args, config):
         if trainer.global_step % val_interval == 0 and trainer.global_step > 0:
             val_metrics = trainer.validate(val_loader)
             if is_rank_zero():
-                tqdm.write(f"\n[Val] Step {trainer.global_step}: "
-                          f"Loss={val_metrics['val_loss']:.1f}, "
-                          f"KL={val_metrics['val_kl']:.1f}, "
-                          f"SI-SDR={val_metrics['val_si_sdr']:.1f}")
+                msg = (f"\n[Val] Step {trainer.global_step}: "
+                       f"Loss={val_metrics['val_loss']:.1f}, "
+                       f"Mel={val_metrics['val_mel']:.1f}, "
+                       f"KL={val_metrics['val_kl']:.1f}, "
+                       f"SI-SDR={val_metrics['val_si_sdr']:.1f}")
+                if val_metrics['val_pesq'] > 0:
+                    msg += f", PESQ={val_metrics['val_pesq']:.2f}"
+                tqdm.write(msg)
                 
                 if args.use_wandb:
                     wandb.log({f'val/{k}': v for k, v in val_metrics.items()}, step=trainer.global_step)
