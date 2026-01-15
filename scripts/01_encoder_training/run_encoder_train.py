@@ -269,6 +269,23 @@ class GANTrainer:
         with torch.amp.autocast('cuda', enabled=False):
             enc_output = self.generator(audio.float())
         
+        # P1 Fix: Progressive unfreezing - freeze structural params in early training
+        # This prevents gradient explosion from tau/omega/sigma during warmup
+        if self.global_step < self.warmup_freeze_steps:
+            # Detach tau, omega, sigma from gradient graph (only amp/phase get gradients)
+            enc_output = {
+                'amplitude': enc_output['amplitude'],
+                'tau': enc_output['tau'].detach(),
+                'omega': enc_output['omega'].detach(),
+                'sigma': enc_output['sigma'].detach(),
+                'phi': enc_output['phi'],
+                'gamma': enc_output['gamma'].detach(),
+                'existence_mask': enc_output['existence_mask'],
+                'existence_prob': enc_output['existence_prob'],
+                'num_frames': enc_output['num_frames'],
+                'atoms_per_frame': enc_output['atoms_per_frame'],
+            }
+        
         # Render in FP32 (renderer requires FP32)
         fake_audio = self.render_batch(enc_output, num_samples)
         
@@ -317,12 +334,16 @@ class GANTrainer:
                 model_sigma=enc_output['sigma'].float()
             )
         
-        # Sparsity loss
-        energy_sparsity = (enc_output['amplitude'] * enc_output['existence_prob']).mean()
-        sparsity_loss = self.sparsity_weight * energy_sparsity
+        # Sparsity loss: P2 Fix - Use L1 penalty on amplitude (encourages true sparsity)
+        # Instead of penalizing total energy, penalize number of active atoms
+        active_amplitude = enc_output['amplitude'] * enc_output['existence_prob']
+        sparsity_loss = self.sparsity_weight * active_amplitude.abs().mean()
+        
+        # Additional sparsity: penalize existence probability directly
+        existence_penalty = 0.0001 * enc_output['existence_prob'].mean()
         
         # Total G loss (scale for accumulation)
-        g_loss = (recon_loss + g_adv_loss.float() + fm_loss.float() + sparsity_loss) / self.accum_steps
+        g_loss = (recon_loss + g_adv_loss.float() + fm_loss.float() + sparsity_loss + existence_penalty) / self.accum_steps
         
         # Check G loss for NaN
         if not torch.isfinite(g_loss):
@@ -335,7 +356,9 @@ class GANTrainer:
         
         if not is_accumulating:
             self.g_scaler.unscale_(self.g_optimizer)
-            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+            # P2 Fix: More aggressive gradient clipping - value clip first, then norm
+            torch.nn.utils.clip_grad_value_(self.generator.parameters(), clip_value=0.5)
+            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=0.5)
             self.g_scaler.step(self.g_optimizer)
             self.g_scaler.update()
             self.g_optimizer.zero_grad()

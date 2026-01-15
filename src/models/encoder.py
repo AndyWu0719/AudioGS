@@ -218,11 +218,11 @@ class GaborGridEncoder(nn.Module):
                     self.grid_freq_bins, self.atoms_per_cell, self.num_params
                 )
                 
-                # 1. Existence bias -> +2.0 (~88% active at start)
-                bias[:, :, 0].fill_(2.0)
+                # 1. Existence bias -> 0.0 (~50% active at start, more conservative)
+                bias[:, :, 0].fill_(0.0)
                 
-                # 2. Amplitude bias -> -2.0 (Softplus(-2) ≈ 0.12)
-                bias[:, :, 1].fill_(-2.0)
+                # 2. Amplitude bias -> -3.0 (Softplus(-3) ≈ 0.05, lower initial energy)
+                bias[:, :, 1].fill_(-3.0)
                 
                 # 3. cos_phi/sin_phi: Initialize to random unit vectors
                 #    cos^2 + sin^2 = 1 helps the network learn proper phase representation
@@ -333,17 +333,19 @@ class GaborGridEncoder(nn.Module):
         # atan2(sin, cos) gives continuous phase in [-π, π] without wrapping issues
         phase = torch.atan2(sin_phi_raw, cos_phi_raw + 1e-7)
         
-        # Local offsets: Allow atoms to cross grid lines (±2 cells)
-        # Tradeoff: Larger range = better coverage but potential overlap
-        # Alternative: Remove tanh and use soft regularization for unbounded movement
-        delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec * 2.0)
-        delta_omega = torch.tanh(delta_omega_raw) * (self.freq_bin_bandwidth * 2.0)
+        # Local offsets: Conservative ranges to prevent gradient explosion
+        # P0 Fix: Reduced from ±2 cells to ±0.5 cells to limit gradient magnification
+        delta_tau = torch.tanh(delta_tau_raw) * (self.time_hop_sec * 0.5)
+        delta_omega = torch.tanh(delta_omega_raw) * (self.freq_bin_bandwidth * 0.5)
         
-        # Sigma: Sigmoid mapped to [sigma_min, sigma_max]
-        sigma = torch.sigmoid(sigma_raw) * (self.sigma_max - self.sigma_min) + self.sigma_min
+        # Sigma: Use softplus with offset for smooth gradients (avoids small sigma explosion)
+        # P0 Fix: softplus(-2) ≈ 0.13, then scale to reasonable range
+        sigma_base = F.softplus(sigma_raw - 2.0) * 0.02 + self.sigma_min
+        sigma = torch.clamp(sigma_base, min=self.sigma_min, max=self.sigma_max)
         
-        # Gamma (chirp): Tanh scaled by gamma_scale (allows ±1000 Hz/s pitch glides)
-        gamma = torch.tanh(gamma_raw) * self.gamma_scale
+        # Gamma (chirp): Reduced scale for stability (±100 Hz/s instead of ±1000)
+        # P0 Fix: Most speech doesn't need aggressive chirp
+        gamma = torch.tanh(gamma_raw) * 100.0
         
         # ============================
         # 5. Grid-to-List conversion (differentiable)

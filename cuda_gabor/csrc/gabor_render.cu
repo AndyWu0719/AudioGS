@@ -89,6 +89,17 @@ __global__ void gabor_forward_kernel(
 // BACKWARD KERNEL
 // =============================================================================
 
+// Soft clipping function: prevents gradient explosion while preserving direction
+// Beyond threshold, uses log-scaling for graceful degradation
+__device__ __forceinline__ float soft_clip(float x, float threshold) {
+    float ax = fabsf(x);
+    if (ax > threshold) {
+        // Log-scale compression beyond threshold
+        return copysignf(threshold * (1.0f + logf(ax / threshold)), x);
+    }
+    return x;
+}
+
 __global__ void gabor_backward_kernel(
     const float* __restrict__ amplitude,
     const float* __restrict__ tau,
@@ -171,13 +182,18 @@ __global__ void gabor_backward_kernel(
         grad_gamma_acc += grad_out * A * envelope * d_carrier_d_gamma;
     }
     
-    // Write gradients
-    grad_amplitude[atom_idx] = grad_A_acc;
-    grad_tau[atom_idx] = grad_tau_acc;
-    grad_omega[atom_idx] = grad_omega_acc;
-    grad_sigma[atom_idx] = grad_sigma_acc;
-    grad_phi[atom_idx] = grad_phi_acc;
-    grad_gamma[atom_idx] = grad_gamma_acc;
+    // Write gradients with soft clipping to prevent explosion
+    // Threshold chosen based on typical gradient magnitudes:
+    // - omega: high freq atoms can produce ~50000x gradient -> clip at 100
+    // - sigma: small sigma can produce ~1e6x gradient -> clip at 100
+    // - tau: interacts with omega -> clip at 100
+    // - amplitude/phi/gamma: less problematic but clip for safety
+    grad_amplitude[atom_idx] = soft_clip(grad_A_acc, 10.0f);
+    grad_tau[atom_idx] = soft_clip(grad_tau_acc, 100.0f);
+    grad_omega[atom_idx] = soft_clip(grad_omega_acc, 100.0f);
+    grad_sigma[atom_idx] = soft_clip(grad_sigma_acc, 100.0f);
+    grad_phi[atom_idx] = soft_clip(grad_phi_acc, 10.0f);
+    grad_gamma[atom_idx] = soft_clip(grad_gamma_acc, 50.0f);
 }
 
 
