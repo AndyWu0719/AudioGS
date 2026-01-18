@@ -49,8 +49,9 @@ class AudioGSModel(nn.Module):
         Initialize atom parameters with F0-guided or STFT-based strategy.
         
         F0-Guided Strategy:
+        - τ: Voiced-weighted sampling (dense in voiced regions, sparse in silence)
         - 40% atoms: Initialize ω at F0 (fundamental frequency)
-        - 40% atoms: Initialize ω at harmonics (2×F0, 3×F0, 4×F0, 5×F0)
+        - 40% atoms: Initialize ω at harmonics up to Nyquist (dynamic, not fixed 2-5×)
         - 20% atoms: Random frequency (for unvoiced sounds)
         
         Args:
@@ -69,13 +70,12 @@ class AudioGSModel(nn.Module):
             waveform_np = waveform.cpu().numpy()
             num_atoms = self.num_atoms
             
-            # Generate random tau positions for all atoms
-            taus = torch.rand(num_atoms, device=self.device) * self.audio_duration
-            
             if use_f0_init:
-                omegas, phis = self._f0_guided_init(waveform_np, taus)
+                # F0-guided init returns voiced-weighted taus
+                taus, omegas, phis = self._f0_guided_init(waveform_np, num_atoms)
             else:
-                # Use robust STFT peak-picking as default (v2.0 fix)
+                # Uniform taus for STFT-based init
+                taus = torch.rand(num_atoms, device=self.device) * self.audio_duration
                 omegas, phis = self._stft_peak_init(waveform, taus, n_fft, hop_length)
             
             # Assign to parameters
@@ -90,19 +90,30 @@ class AudioGSModel(nn.Module):
             # Amplitude: small initial values
             self._amplitude_logit.data.fill_(-2.0)  # softplus(-2) ≈ 0.13
             
-            # Sigma: 2-5ms range
-            self._sigma_logit.data.uniform_(math.log(0.002), math.log(0.005))
+            # CONSTANT-Q SIGMA: σ inversely proportional to frequency
+            # This ensures ~N cycles per atom regardless of frequency
+            # Bass (100Hz): σ ≈ 40ms (4 cycles)
+            # Treble (8kHz): σ ≈ 0.5ms (4 cycles)
+            N_CYCLES = 4.0  # Perceptually balanced (~4 cycles per atom)
+            constant_q_sigma = N_CYCLES / omegas.clamp(min=50.0)  # Hz → seconds
+            constant_q_sigma = constant_q_sigma.clamp(min=0.001, max=0.100)  # 1ms-100ms range
+            self._sigma_logit.data = torch.log(constant_q_sigma)
             
-            # Gamma (chirp): zero initially
+            # Gamma (chirp): zero initially (no frequency modulation)
             self._gamma.data.zero_()
             
-            print(f"[AudioGSModel] Initialized {num_atoms} atoms.")
+            print(f"[AudioGSModel] Initialized {num_atoms} atoms (Constant-Q sigma).")
     
-    def _f0_guided_init(self, waveform_np, taus: torch.Tensor):
+    def _f0_guided_init(self, waveform_np, num_atoms: int):
         """
         F0-guided frequency initialization using librosa.pyin.
         
+        AUDIO PHYSICS:
+        - τ sampled weighted by voicing probability (dense in voiced, sparse in silence)
+        - Harmonics extend dynamically to Nyquist (not fixed 2-5×)
+        
         Returns:
+            taus: Time positions for each atom (voiced-weighted)
             omegas: Frequency values in Hz for each atom
             phis: Phase values for each atom
         """
@@ -110,10 +121,7 @@ class AudioGSModel(nn.Module):
         from scipy.interpolate import interp1d
         import numpy as np
         
-        num_atoms = len(taus)
-        taus_np = taus.cpu().numpy()
-        
-        # Extract F0 using pyin
+        # Extract F0 using pyin (returns voiced_prob for weighting)
         f0, voiced_flag, voiced_prob = librosa.pyin(
             waveform_np,
             fmin=librosa.note_to_hz('C2'),  # ~65 Hz
@@ -130,34 +138,48 @@ class AudioGSModel(nn.Module):
         f0_valid = np.where(np.isnan(f0), 0, f0)
         voiced_mask = ~np.isnan(f0)
         
-        # CONFIDENCE CHECK: If voiced ratio is too low, fallback to STFT init
+        # CONFIDENCE CHECK: If voiced ratio is too low, fallback to uniform tau + STFT
         voiced_ratio = np.mean(voiced_mask)
         if voiced_ratio < 0.3:
             print(f"[F0 Init] Low voiced ratio ({voiced_ratio:.1%}), falling back to STFT init")
-            return self._stft_init(
+            taus = torch.rand(num_atoms, device=self.device) * self.audio_duration
+            omegas, phis = self._stft_init(
                 torch.from_numpy(waveform_np).float().to(self.device),
                 taus, n_fft=2048, hop_length=512
             )
+            return taus, omegas, phis
         
-        # Create interpolator for F0
-        if np.any(voiced_mask):
-            # Use valid F0 values for interpolation, fill NaN regions with 0
-            f0_interp = interp1d(
-                f0_times, f0_valid,
-                kind='linear', bounds_error=False, fill_value=0
-            )
-            f0_at_taus = f0_interp(taus_np)
-            
-            # Create voiced/unvoiced mask for atoms
-            voiced_interp = interp1d(
-                f0_times, voiced_mask.astype(float),
-                kind='nearest', bounds_error=False, fill_value=0
-            )
-            is_voiced = voiced_interp(taus_np) > 0.5
-        else:
-            # Entirely unvoiced
-            f0_at_taus = np.zeros(num_atoms)
-            is_voiced = np.zeros(num_atoms, dtype=bool)
+        # =====================================================
+        # VOICED-WEIGHTED TAU SAMPLING
+        # Dense in voiced regions, sparse in silence
+        # =====================================================
+        # voiced_prob has NaN for unvoiced frames, replace with small epsilon
+        voiced_weights = np.where(np.isnan(voiced_prob), 0.05, voiced_prob)
+        # Normalize to probability distribution
+        voiced_weights = voiced_weights / (voiced_weights.sum() + 1e-8)
+        
+        # Sample frame indices weighted by voicing probability
+        frame_indices = np.random.choice(
+            len(f0_times), size=num_atoms, replace=True, p=voiced_weights
+        )
+        # Add small jitter within each frame's hop window
+        jitter = np.random.uniform(-0.5, 0.5, size=num_atoms) * (512 / self.sample_rate)
+        taus_np = f0_times[frame_indices] + jitter
+        taus_np = np.clip(taus_np, 0, self.audio_duration - 1e-6)
+        taus = torch.from_numpy(taus_np).float().to(self.device)
+        
+        # Create interpolators for F0 and voiced mask
+        f0_interp = interp1d(
+            f0_times, f0_valid,
+            kind='linear', bounds_error=False, fill_value=0
+        )
+        f0_at_taus = f0_interp(taus_np)
+        
+        voiced_interp = interp1d(
+            f0_times, voiced_mask.astype(float),
+            kind='nearest', bounds_error=False, fill_value=0
+        )
+        is_voiced = voiced_interp(taus_np) > 0.5
         
         # Distribution strategy
         num_f0 = int(num_atoms * 0.4)         # 40% at F0
@@ -180,14 +202,19 @@ class AudioGSModel(nn.Module):
                 # Unvoiced region: random high frequency (fricatives)
                 omegas[idx] = np.random.uniform(2000, 8000)
         
-        # Harmonic atoms (40%): 2×F0 to 5×F0
-        harmonics = [2, 3, 4, 5]
+        # Harmonic atoms (40%): DYNAMIC harmonics up to Nyquist
+        # Instead of fixed [2,3,4,5], compute max harmonic for each F0
         for i, idx in enumerate(harmonic_indices):
-            h = harmonics[i % len(harmonics)]
             if is_voiced[idx] and f0_at_taus[idx] > 50:
-                harmonic_freq = f0_at_taus[idx] * h
-                # Clamp to Nyquist
-                omegas[idx] = min(harmonic_freq, self.nyquist_freq * 0.95)
+                f0_hz = f0_at_taus[idx]
+                # Compute max harmonic that fits under Nyquist
+                max_harmonic = int(self.nyquist_freq * 0.95 / f0_hz)
+                if max_harmonic >= 2:
+                    # Randomly select a harmonic from [2, max_harmonic]
+                    h = np.random.randint(2, max_harmonic + 1)
+                    omegas[idx] = f0_hz * h
+                else:
+                    omegas[idx] = f0_hz  # F0 too high, use fundamental
             else:
                 # Unvoiced: random
                 omegas[idx] = np.random.uniform(1000, 10000)
@@ -267,11 +294,10 @@ class AudioGSModel(nn.Module):
         omegas_tensor = torch.from_numpy(omegas).float().to(self.device)
         phis_tensor = torch.from_numpy(phis).float().to(self.device)
         
-        # Note: f0_pitch is the original F0 array from pyin (not the loop variable)
-        print(f"[F0 Init] Voiced atoms: {np.sum(is_voiced)}/{num_atoms}, "
-              f"Phase: STFT bilinear interpolation")
+        print(f"[F0 Init] Voiced-weighted τ sampling, dynamic harmonics up to Nyquist")
+        print(f"[F0 Init] Voiced atoms: {np.sum(is_voiced)}/{num_atoms}, Phase: STFT bilinear interpolation")
         
-        return omegas_tensor, phis_tensor
+        return taus, omegas_tensor, phis_tensor
     
     def _stft_peak_init(self, waveform: torch.Tensor, taus: torch.Tensor, n_fft: int = 2048, hop_length: int = 512):
         """
@@ -444,16 +470,52 @@ class AudioGSModel(nn.Module):
             self.tau_grad_accum = self.tau_grad_accum[mask]
 
     def clone_atoms_by_indices(self, indices):
+        """
+        Clone atoms using HARMONIC STACKING for additive synthesis.
+        
+        AUDIO PHYSICS: Instead of random frequency perturbation,
+        clones are created at the next harmonic overtone (2×ω, 3×ω, etc.)
+        This enables differentiable additive synthesis.
+        
+        CONSTANT-Q: When doubling frequency, sigma is HALVED to maintain
+        the same number of cycles per atom.
+        """
         if len(indices) == 0: return 0
         with torch.no_grad():
-            new_amp = self._amplitude_logit.data[indices].clone()
-            new_tau = self._tau.data[indices].clone() + torch.randn_like(self._tau.data[indices]) * 0.001
-            # Add freq noise
-            new_omega = self._omega_logit.data[indices].clone() + torch.randn_like(self._omega_logit.data[indices]) * 0.02
-            new_sigma = self._sigma_logit.data[indices].clone()
-            new_phi = self._phi.data[indices].clone()
-            new_gamma = self._gamma.data[indices].clone()
-        self.add_atoms(new_amp, new_tau, new_omega, new_sigma, new_phi, new_gamma)
+            # Get parent frequencies (in Hz)
+            parent_omega_hz = self.omega[indices]  # Already in Hz via property
+            
+            # Compute next valid harmonic for each atom
+            # Target: 2×ω for first clone, but clamp to Nyquist
+            harmonic_multiplier = 2.0
+            target_omega_hz = parent_omega_hz * harmonic_multiplier
+            
+            # Clamp to 95% of Nyquist to stay safe
+            max_omega = self.nyquist_freq * 0.95
+            target_omega_hz = torch.clamp(target_omega_hz, max=max_omega)
+            
+            # Skip atoms where harmonic would exceed Nyquist
+            valid_mask = target_omega_hz < max_omega
+            if not valid_mask.any():
+                # All harmonics would exceed Nyquist, use slight perturbation instead
+                target_omega_hz = parent_omega_hz * 1.01  # 1% frequency shift
+                harmonic_multiplier = 1.01  # Minimal sigma change
+            
+            # Convert target omega to logit space
+            omega_normalized = (target_omega_hz / self.nyquist_freq).clamp(1e-5, 1 - 1e-5)
+            new_omega_logit = torch.log(omega_normalized / (1 - omega_normalized))
+            
+            # Clone other parameters
+            new_amp = self._amplitude_logit.data[indices].clone() - 0.5  # Reduce amplitude for harmonic
+            new_tau = self._tau.data[indices].clone()  # Same time position
+            
+            # CONSTANT-Q: Halve sigma when doubling frequency (log space: subtract log(2))
+            new_sigma = self._sigma_logit.data[indices].clone() - math.log(harmonic_multiplier)
+            
+            new_phi = self._phi.data[indices].clone()  # Same phase alignment
+            new_gamma = self._gamma.data[indices].clone()  # Same chirp
+            
+        self.add_atoms(new_amp, new_tau, new_omega_logit, new_sigma, new_phi, new_gamma)
         return len(indices)
 
     def split_atoms_by_indices(self, indices, scale_factor=1.6):

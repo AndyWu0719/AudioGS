@@ -437,6 +437,14 @@ class CombinedAudioLoss(nn.Module):
     Combined loss for AudioGS training.
     
     Includes phase-aware Complex STFT Loss for better PESQ.
+    
+    AUDIO PHYSICS - CRITICAL WEIGHT REQUIREMENT:
+    Time-domain MSE is non-convex (Phase Retrieval problem).
+    STFT-domain loss must DOMINATE (>90% weight) over time-domain L1 to ensure convergence.
+    
+    Recommended weights:
+    - stft_weight + mel_weight + phase_weight: Should be ~90%+ of total
+    - time_weight: Should be ≤10% of spectral weights
     """
     
     def __init__(
@@ -449,11 +457,22 @@ class CombinedAudioLoss(nn.Module):
         stft_weight: float = 1.0,
         mel_weight: float = 1.0,
         time_weight: float = 0.5,
-        phase_weight: float = 0.5,     # NEW: Complex STFT for phase alignment
+        phase_weight: float = 0.5,     # Complex STFT for phase alignment
         amp_reg_weight: float = 0.01,
         pre_emp_weight: float = 20.0,
     ):
         super().__init__()
+        
+        # AUDIO PHYSICS: Warn if time-domain weight is too high
+        spectral_total = stft_weight + mel_weight + phase_weight
+        if time_weight > 0.1 * spectral_total:
+            import warnings
+            warnings.warn(
+                f"[CombinedAudioLoss] time_weight={time_weight} is >10% of spectral weights "
+                f"({spectral_total}). This may cause non-convex optimization issues. "
+                f"Recommended: time_weight ≤ {0.1 * spectral_total:.2f}",
+                UserWarning
+            )
         
         self.stft_weight = stft_weight
         self.mel_weight = mel_weight

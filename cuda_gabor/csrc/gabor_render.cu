@@ -4,8 +4,14 @@
  * High-performance forward and backward kernels for Gabor atom rendering.
  * Similar architecture to 3DGS's diff-gaussian-rasterization.
  * 
- * Gabor atom equation:
+ * Gabor atom equation (σ = duration parameterization):
  *   g(t) = A * exp(-(t-τ)²/(2σ²)) * cos(2π(ω(t-τ) + ½γ(t-τ)²) + φ)
+ * 
+ * AUDIO PHYSICS NOTE:
+ * - Truncation at 5-6σ recommended for -100dB cutoff (inaudible)
+ * - 3σ truncation causes audible hissing (only -39dB)
+ * - Hann taper applied at edges to prevent spectral leakage (Gibbs phenomenon)
+ * - Uses atomicAdd for linear superposition (NOT alpha blending)
  */
 
 #include <cuda.h>

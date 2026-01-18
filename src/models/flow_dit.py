@@ -190,12 +190,26 @@ class FlowDiT(nn.Module):
     """
     Flow Matching DiT for generating Gabor atom parameters.
     
-    Uses anchor-based hierarchical approach inspired by DiffGS:
-    - Transformer processes num_anchors tokens (e.g., 2560)
-    - Splitting head expands each anchor to split_factor atoms (e.g., 8)
-    - Total output: num_anchors * split_factor atoms (e.g., 20480)
+    ANCHOR-BASED ARCHITECTURE (solves permutation variance in set generation):
+    -------------------------------------------------------------------------
+    Instead of processing all atoms directly, we use temporal anchors:
     
-    This reduces attention complexity from O(N²) to O((N/K)²).
+    1. Input atoms are pooled into `num_anchors` anchor tokens via Conv1d
+    2. Transformer operates on anchors (not full atom count)
+    3. Splitting head expands each anchor back to `split_factor` atoms
+    
+    Example configuration (for 3s audio at 24kHz with 20480 atoms):
+    - num_anchors = 2560 (temporal anchor grid)
+    - split_factor = 8 (atoms per anchor)
+    - total_atoms = 2560 × 8 = 20480
+    - Anchor spacing: 3.0s / 2560 ≈ 1.17ms between anchors
+    
+    BENEFITS:
+    - Reduces attention complexity from O(N²) to O((N/K)²)
+    - Atoms are generated RELATIVE to anchors (resolves permutation ambiguity)
+    - Hierarchical structure: anchors for coarse timing, splits for fine detail
+    
+    This is inspired by DiffGS (Hierarchical 3D Gaussian Diffusion).
     """
     
     def __init__(
