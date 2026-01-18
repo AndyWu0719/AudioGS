@@ -22,10 +22,10 @@ encoder_model:
 
 # Training (Pure Autoencoder - No GAN)
 training:
-  batch_size: 32              # Single batch size (no phase switching)
-  accumulation_steps: 8      # Effective batch = 8*8*4GPUs = 256
+  batch_size: 16              # Single batch size (no phase switching)
+  accumulation_steps: 1      # Effective batch = 8*8*4GPUs = 256
   learning_rate: 0.0002      # AdamW
-  max_steps: 100000
+  max_steps: 300000
   warmup_steps: 1000
   val_interval: 2000
   save_interval: 10000
@@ -37,12 +37,13 @@ loss:
   hop_sizes: [512, 256, 128, 32]
   win_lengths: [2048, 1024, 512, 128]
   spectral_weight: 1.0       # Multi-scale STFT
-  mel_weight: 45.0           # Strong mel reconstruction
+  mel_weight: 45.0           # Strong mel reconstruction (Primary Driver)
   time_domain_weight: 0.1    # Light time-domain L1
-  phase_weight: 2.0          # Phase-aware loss
+  phase_weight: 1.0          # Reduced to avoid interference during placement
   amp_l1_weight: 0.0001      # Very light amplitude L1 (natural sparsity)
   amp_reg_weight: 0.0        # Disabled (use amp_l1_weight instead)
   pre_emp_weight: 2.0        # Pre-emphasis for high-frequency detail
+  phase_reg_weight: 0.1
 
 # Distributed Training
 distributed:

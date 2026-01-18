@@ -183,7 +183,7 @@ class AutoencoderTrainer:
         max_steps = train_cfg.get('max_steps', 100000)
         
         warmup = LinearLR(self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-        cosine = CosineAnnealingLR(self.optimizer, T_max=max_steps - warmup_steps)
+        cosine = CosineAnnealingLR(self.optimizer, T_max=max_steps - warmup_steps, eta_min=1e-6)
         self.scheduler = SequentialLR(self.optimizer, [warmup, cosine], [warmup_steps])
         
         # ========== Gradient Accumulation ==========
@@ -258,11 +258,12 @@ class AutoencoderTrainer:
             self.accum_count += 1
             return self._nan_metrics()
         
-        # Reconstruction loss
+        # Reconstruction loss with phase vector regularization
         recon_loss, loss_dict = self.recon_loss_fn(
             fake_audio.float(), audio.float(),
             model_amplitude=enc_output['amplitude'].float(),
-            model_sigma=enc_output['sigma'].float()
+            model_sigma=enc_output['sigma'].float(),
+            model_phase_raw=(enc_output['cos_phi_raw'].float(), enc_output['sin_phi_raw'].float())
         )
         
         # Optional: Light L1 on amplitude (encourages sparsity naturally)
@@ -337,11 +338,19 @@ class AutoencoderTrainer:
                 if PESQ_AVAILABLE and i < 5:
                     try:
                         for b in range(min(audio.shape[0], 2)):
-                            ref = audio[b].cpu().numpy()
-                            deg = fake_audio[b].detach().cpu().numpy()
-                            total_pesq += pesq(self.sample_rate, ref, deg, 'wb')
-                    except:
-                        pass
+                            ref = audio[b].cpu()
+                            deg = fake_audio[b].detach().cpu()
+                            # PESQ only supports 8000Hz (NB) or 16000Hz (WB)
+                            # Resample from 24000Hz to 16000Hz
+                            if self.sample_rate != 16000:
+                                ref = torchaudio.functional.resample(ref, self.sample_rate, 16000).numpy()
+                                deg = torchaudio.functional.resample(deg, self.sample_rate, 16000).numpy()
+                            else:
+                                ref = ref.numpy()
+                                deg = deg.numpy()
+                            total_pesq += pesq(16000, ref, deg, 'wb')
+                    except Exception as e:
+                        pass  # Silently skip PESQ errors
                 
                 count += 1
         

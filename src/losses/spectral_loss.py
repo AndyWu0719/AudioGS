@@ -502,7 +502,9 @@ class CombinedAudioLoss(nn.Module):
         target: torch.Tensor,
         model_amplitude: Optional[torch.Tensor] = None,
         model_sigma: Optional[torch.Tensor] = None,
+        model_phase_raw: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         sigma_diversity_weight: float = 0.001,
+        phase_reg_weight: float = 0.1,  # Strong enough to keep vectors healthy
     ) -> Tuple[torch.Tensor, dict]:
         
         # 1. Standard Losses (Dominantly Low/Mid Freq)
@@ -510,7 +512,7 @@ class CombinedAudioLoss(nn.Module):
         mel_loss = self.mel_loss(pred, target)
         time_loss = F.l1_loss(pred, target)
         
-        # 2. Phase-aware Complex STFT Loss (NEW - crucial for PESQ > 3.0)
+        # 2. Phase-aware Complex STFT Loss (crucial for PESQ > 3.0)
         phase_loss = self.complex_stft_loss(pred, target)
         
         # 3. Pre-emphasis Loss (Dominantly High Freq)
@@ -529,23 +531,33 @@ class CombinedAudioLoss(nn.Module):
             sigma_variance = log_sigma.var()
             sigma_div = F.relu(1.0 - sigma_variance)
         
+        # 5. Phase Vector Circular Regularization (NEW)
+        # Penalize deviation from unit circle to prevent vector collapse (→ atan2 gradient explosion)
+        phase_reg = 0.0
+        if model_phase_raw is not None:
+            cos_raw, sin_raw = model_phase_raw
+            radius_sq = cos_raw**2 + sin_raw**2
+            phase_reg = ((radius_sq - 1.0)**2).mean()
+        
         # Combine all losses
         total_loss = (
             self.stft_weight * stft_total +
             self.mel_weight * mel_loss +
             self.time_weight * time_loss +
-            self.phase_weight * phase_loss +      # NEW: Phase alignment
+            self.phase_weight * phase_loss +
             self.amp_reg_weight * amp_reg +
             sigma_diversity_weight * sigma_div +
-            self.pre_emp_weight * pre_emp_loss
+            self.pre_emp_weight * pre_emp_loss +
+            phase_reg_weight * phase_reg  # NEW: circular regularization
         )
         
         loss_dict = {
             "stft": stft_total.item(),
             "mel": mel_loss.item(),
             "time": time_loss.item(),
-            "phase": phase_loss.item(),  # NEW
+            "phase": phase_loss.item(),
             "pre_emp": pre_emp_loss.item(),
+            "phase_reg": phase_reg if isinstance(phase_reg, float) else phase_reg.item(),  # NEW
             "total": total_loss.item(),
         }
         

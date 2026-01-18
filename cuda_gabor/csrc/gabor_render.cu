@@ -162,8 +162,10 @@ __global__ void gabor_backward_kernel(
         
         // Envelope derivatives
         // d(envelope)/d(tau) = envelope * (t-tau)/sigma^2 * d(t-tau)/d(tau)
-        //                    = envelope * (t-tau)/sigma^2 * (-1)  [chain rule!]
-        const float d_envelope_d_tau = -envelope * t_centered / sigma_sq;  // NOTE: negative!
+        //                    = envelope * (t-tau)/sigma^2 * (-1)
+        //                    = envelope * (t_centered)/sigma^2 * (-1)
+        //                    = envelope * t_centered / sigma^2
+        const float d_envelope_d_tau = envelope * t_centered / sigma_sq;  // Fixed: removed incorrect negative sign
         const float d_envelope_d_sigma = envelope * t_sq / (sigma_i * sigma_sq);
 
         
