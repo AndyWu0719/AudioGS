@@ -1,38 +1,63 @@
-# Stage 00: High-Quality Atom Fitting Config
-# ==========================================
-# Based on proven config that achieved high quality on 1s audio
-# Uses LibriTTS_R 24kHz
+# Stage 00: Atom Fitting Config (Physics Pillars Compliant)
+# ==========================================================
+# Implements: Constant-Q Init, STFT Dominance, No Occlusion
 
 # Data
 data:
-  dataset_path: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R"
+  dataset_path: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R/train/train-clean-100"
   sample_rate: 24000
-  max_audio_length: 10.0  # Full audio duration
+  max_audio_length: 10.0  # Max audio duration (seconds)
 
 # Model
 model:
   initial_num_atoms: 4096
   max_num_atoms: 16384
 
-# Training (proven hyperparameters)
+# Initialization (PILLAR 3: Constant-Q)
+initialization:
+  constant_q_cycles: 4.0     # Number of cycles per atom (Gabor quality factor)
+  sigma_min: 0.001           # Minimum sigma (1ms for transients)
+  sigma_max: 0.100           # Maximum sigma (100ms for bass)
+
+# Training
 training:
   learning_rate: 0.001
-  lr_amplitude: 0.01820902986692016
-  lr_position: 0.00010418414874128424
-  lr_frequency: 0.0013375384144741348
-  lr_sigma: 0.014100480988103629
-  lr_phase: 0.011464829306470156
+  lr_amplitude: 0.018
+  lr_position: 0.0001
+  lr_frequency: 0.0013
+  lr_sigma: 0.014
+  lr_phase: 0.0115
   lr_chirp: 0.002
   max_iters: 12000
+  log_interval: 50
+  vis_interval: 2000
 
-# Loss (proven configuration)
+# Loss (PILLAR 4: STFT > 90%)
+# Total spectral = spectral_weight(1.0) + mel_weight(45.0) + phase_weight(1.0) = 47.0
+# time_domain_weight = 0.1 = 0.2% of spectral (< 10% ✓)
 loss:
   fft_sizes: [2048, 1024, 512, 128]
   hop_sizes: [512, 256, 128, 32]
   win_lengths: [2048, 1024, 512, 128]
-  spectral_weight: 1.0
-  mel_weight: 0.5           # Lower than encoder config
-  time_domain_weight: 0.1
-  phase_weight: 0.8         # High for phase alignment
-  amp_reg_weight: 0.01      # Original value
-  pre_emp_weight: 20.0      # Higher pre-emphasis
+  spectral_weight: 1.0       # Spectral Convergence + Log-Mag
+  mel_weight: 45.0           # Strong mel reconstruction
+  time_domain_weight: 0.1    # PILLAR 4: < 10% of spectral
+  phase_weight: 1.0          # Complex STFT for phase
+  amp_reg_weight: 0.0001     # Light amplitude regularization
+  pre_emp_weight: 2.0        # Pre-emphasis for HF detail
+
+# Density Control (PILLAR 5)
+density_control:
+  grad_threshold: 0.0002
+  sigma_split_threshold: 0.01  # 10ms threshold
+  prune_amplitude_threshold: 0.001
+  densify_from_iter: 500
+  densify_until_iter: 10000
+  densification_interval: 100
+  sigma_diversity_weight: 0.001
+
+# Output
+output:
+  root_dir: "logs/00_atom_fitting"
+  save_audio: true
+  save_visualization: true

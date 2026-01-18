@@ -1,8 +1,16 @@
 """
-CUDA Extension Training Script for Audio Gaussian Splatting.
+AudioGS Atom Fitting Script (Physics Pillars Compliant)
 
-Uses custom C++/CUDA kernels for maximum performance.
-Expected speedup: 2-3x compared to standard PyTorch version.
+Implements:
+- Pillar 1: atomicAdd (Linear Superposition)
+- Pillar 3: Constant-Q Sigma Initialization (σ ∝ 1/ω)
+- Pillar 4: STFT Loss > 90%
+- Pillar 5: Harmonic Cloning
+
+Usage:
+    conda activate qwen2_CALM
+    cd /data0/determined/users/andywu/GS-TS
+    python scripts/00_atom_fitting/fit_single_audio.py
 """
 
 import os
@@ -11,110 +19,225 @@ import argparse
 import yaml
 from pathlib import Path
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List, Tuple, Optional
 
 import torch
-import torch.distributed as dist
+import torchaudio
+import numpy as np
 from tqdm import tqdm
 
-# Add paths
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent / "cuda_gabor"))
+# Add src to path
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "cuda_gabor"))
 
-from models.atom import AudioGSModel
-from cuda_gabor import get_cuda_gabor_renderer
-from losses.spectral_loss import CombinedAudioLoss
-from utils.data_loader import get_dataloader
-from utils.density_control import AdaptiveDensityController, rebuild_optimizer_from_model
-from utils.visualization import Visualizer
+from src.models.atom import AudioGSModel
+from src.losses.spectral_loss import CombinedAudioLoss
+from src.utils.density_control import AdaptiveDensityController, rebuild_optimizer_from_model
+from src.utils.visualization import Visualizer
+from src.tools.metrics import compute_mss_loss
+
+# Try to import CUDA renderer
+CUDA_EXT_AVAILABLE = False
+GaborRendererCUDA = None
+
+# Try installed package first
+try:
+    from cuda_gabor import GaborRendererCUDA, CUDA_EXT_AVAILABLE
+    print("[Renderer] Using installed cuda_gabor package")
+except ImportError:
+    # Try local path
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "cuda_gabor"))
+        from cuda_gabor import GaborRendererCUDA, CUDA_EXT_AVAILABLE
+        print("[Renderer] Using local cuda_gabor")
+    except ImportError:
+        print("[Warning] CUDA extension not available, will use PyTorch fallback")
+
+# ============================================================
+# BENCHMARK TEST FILES (Pre-selected via torchaudio.info)
+# These are closest to 1s, 3s, 5s durations in LibriTTS_R/train-clean-100
+# ============================================================
+TEST_FILES = [
+    # Short (~1s) - Will be found by scan
+    None,
+    # Medium (~3s) - Will be found by scan
+    None,
+    # Long (~5s) - Will be found by scan
+    None,
+]
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="AudioGS Training (CUDA Extension)")
-    parser.add_argument("--target_file", type=str, default=None)
-    parser.add_argument("--data_path", type=str, 
-                        default="/data0/determined/users/andywu/workplace/data/raw/LibriTTS_R")
-    parser.add_argument("--config", type=str, default="configs/AudioGS_config.yaml")
-    parser.add_argument("--max_iters", type=int, default=None)
-    parser.add_argument("--output_dir", type=str, default="logs")
-    parser.add_argument("--exp_name", type=str, default=None)
-    parser.add_argument("--local_rank", type=int, default=-1)
-    return parser.parse_args()
+def find_test_files_by_duration(
+    root_path: str,
+    target_durations: List[float] = [1.0, 3.0, 5.0],
+    sample_rate: int = 24000,
+) -> List[str]:
+    """
+    Find audio files closest to target durations using torchaudio.info.
+    
+    Args:
+        root_path: Root directory to scan
+        target_durations: List of target durations in seconds
+        sample_rate: Expected sample rate
+        
+    Returns:
+        List of file paths, one per target duration
+    """
+    print(f"[Benchmark] Scanning {root_path} for test files...")
+    
+    root = Path(root_path)
+    all_files = list(root.rglob("*.wav"))
+    
+    if len(all_files) == 0:
+        raise ValueError(f"No WAV files found in {root_path}")
+    
+    print(f"[Benchmark] Found {len(all_files)} WAV files, filtering by duration...")
+    
+    # Collect file durations
+    file_durations = []
+    for i, fpath in enumerate(all_files[:500]):  # Limit to first 500 for speed
+        try:
+            info = torchaudio.info(str(fpath))
+            duration = info.num_frames / info.sample_rate
+            file_durations.append((fpath, duration))
+        except Exception:
+            continue
+        
+        if (i + 1) % 100 == 0:
+            print(f"  Scanned {i+1} files...")
+    
+    # Find closest files to each target duration
+    result = []
+    for target in target_durations:
+        best_file = None
+        best_diff = float('inf')
+        
+        for fpath, duration in file_durations:
+            diff = abs(duration - target)
+            if diff < best_diff:
+                best_diff = diff
+                best_file = (fpath, duration)
+        
+        if best_file:
+            result.append(str(best_file[0]))
+            print(f"  Target {target}s: {best_file[0].name} ({best_file[1]:.2f}s)")
+        else:
+            result.append(None)
+    
+    return result
 
 
 def load_config(path: str) -> Dict:
+    """Load YAML configuration."""
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-def setup_distributed():
-    if "RANK" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend="nccl", init_method="env://")
-        torch.cuda.set_device(local_rank)
-        return True, rank, world_size, local_rank
-    return False, 0, 1, 0
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def train(args, config: Dict):
-    is_distributed, rank, world_size, local_rank = setup_distributed()
-    is_main = (rank == 0)
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+def load_audio(path: str, sample_rate: int = 24000) -> Tuple[torch.Tensor, int]:
+    """Load audio file and resample if needed."""
+    waveform, sr = torchaudio.load(path)
     
-    # Output dir
-    if args.exp_name is None:
-        exp_name = f"cuda_ext_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    else:
-        exp_name = args.exp_name
+    # Convert to mono
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
     
-    output_dir = Path(args.output_dir) / exp_name
-    if is_main:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[CUDA-Ext] Output: {output_dir}")
-        print(f"[CUDA-Ext] Device: {device}")
+    # Resample if needed
+    if sr != sample_rate:
+        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
     
-    # Config
+    return waveform.squeeze(0), sample_rate
+
+
+def compute_metrics(
+    gt_waveform: torch.Tensor,
+    pred_waveform: torch.Tensor,
+    sample_rate: int = 24000,
+) -> Dict[str, float]:
+    """Compute reconstruction quality metrics."""
+    # Ensure same length
+    min_len = min(len(gt_waveform), len(pred_waveform))
+    gt = gt_waveform[:min_len]
+    pred = pred_waveform[:min_len]
+    
+    # MSS Loss (Multi-Scale Spectral)
+    mss = compute_mss_loss(gt, pred, sample_rate)
+    
+    # L1 Loss
+    l1 = torch.nn.functional.l1_loss(pred, gt).item()
+    
+    # SNR
+    noise = pred - gt
+    signal_power = (gt ** 2).mean()
+    noise_power = (noise ** 2).mean()
+    snr = 10 * torch.log10(signal_power / (noise_power + 1e-8)).item()
+    
+    # Mel L1 (approximate)
+    try:
+        mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate, n_fft=1024, hop_length=256, n_mels=80
+        )
+        mel_gt = mel_transform(gt.unsqueeze(0))
+        mel_pred = mel_transform(pred.unsqueeze(0))
+        mel_l1 = torch.nn.functional.l1_loss(
+            torch.log(mel_pred + 1e-5), torch.log(mel_gt + 1e-5)
+        ).item()
+    except Exception:
+        mel_l1 = float('nan')
+    
+    return {
+        'mss_loss': mss,
+        'l1_loss': l1,
+        'snr_db': snr,
+        'mel_l1': mel_l1,
+    }
+
+
+def fit_single_audio(
+    audio_path: str,
+    config: Dict,
+    output_dir: Path,
+    device: torch.device,
+) -> Dict[str, float]:
+    """
+    Fit Gabor atoms to a single audio file.
+    
+    Returns:
+        Dict of metrics
+    """
     sample_rate = config["data"]["sample_rate"]
-    max_iters = args.max_iters or config["training"]["max_iters"]
+    max_iters = config["training"]["max_iters"]
     
-    # Data
-    dataloader, _ = get_dataloader(
-        root_path=args.data_path,
-        target_file=args.target_file,
-        batch_size=1,
-        sample_rate=sample_rate,
-        max_audio_length=config["data"]["max_audio_length"],
-        subsets=config["data"].get("subsets"),
-        shuffle=False,
-    )
-    
-    fixed_batch = next(iter(dataloader))
-    gt_waveform = fixed_batch["waveforms"][0].to(device)
-    num_samples = int(fixed_batch["lengths"][0].item())
+    # Load audio
+    gt_waveform, _ = load_audio(audio_path, sample_rate)
+    gt_waveform = gt_waveform.to(device)
+    num_samples = len(gt_waveform)
     audio_duration = num_samples / sample_rate
     
-    if is_main:
-        print(f"[CUDA-Ext] Target: {fixed_batch['file_paths'][0]}")
-        print(f"[CUDA-Ext] Duration: {audio_duration:.2f}s")
+    filename = Path(audio_path).stem
+    print(f"\n[Fit] {filename} ({audio_duration:.2f}s, {num_samples} samples)")
     
-    # Model
+    # Initialize model
     model = AudioGSModel(
         num_atoms=config["model"]["initial_num_atoms"],
         sample_rate=sample_rate,
         audio_duration=audio_duration,
         device=device,
     )
+    
+    # Initialize from audio (uses Constant-Q sigma internally)
     model.initialize_from_audio(gt_waveform)
     
-    # CUDA Extension Renderer
-    renderer = get_cuda_gabor_renderer(sample_rate=sample_rate)
+    # Renderer
+    if CUDA_EXT_AVAILABLE:
+        try:
+            renderer = GaborRendererCUDA(sample_rate=sample_rate, sigma_multiplier=5.0)
+            print("[Fit] Using CUDA renderer (5σ truncation)")
+        except Exception as e:
+            print(f"[Fit] CUDA renderer failed ({e}), using PyTorch fallback")
+            renderer = None
+    else:
+        renderer = None
     
     # Loss
     loss_config = config["loss"]
@@ -124,10 +247,11 @@ def train(args, config: Dict):
         hop_sizes=loss_config["hop_sizes"],
         win_lengths=loss_config["win_lengths"],
         stft_weight=loss_config.get("spectral_weight", 1.0),
-        mel_weight=loss_config.get("mel_weight", 0.5),
+        mel_weight=loss_config.get("mel_weight", 45.0),
         time_weight=loss_config.get("time_domain_weight", 0.1),
-        amp_reg_weight=loss_config.get("amp_reg_weight", 0.01),
-        pre_emp_weight=loss_config.get("pre_emp_weight", 20.0),
+        phase_weight=loss_config.get("phase_weight", 1.0),
+        amp_reg_weight=loss_config.get("amp_reg_weight", 0.0001),
+        pre_emp_weight=loss_config.get("pre_emp_weight", 2.0),
     )
     
     # Optimizer
@@ -147,20 +271,19 @@ def train(args, config: Dict):
         max_num_atoms=config["model"]["max_num_atoms"],
     )
     
-    # Visualizer
-    if is_main:
-        visualizer = Visualizer(str(output_dir), sample_rate)
-        visualizer.save_audio(gt_waveform, "target_gt")
-        pbar = tqdm(range(max_iters), desc="Training (CUDA-Ext)")
-    else:
-        pbar = range(max_iters)
-    
     # Training loop
+    pbar = tqdm(range(max_iters), desc=f"Fitting {filename}", leave=False)
+    
     for iteration in pbar:
         amplitude, tau, omega, sigma, phi, gamma = model.get_all_params()
         
-        # CUDA extension forward
-        pred_waveform = renderer(amplitude, tau, omega, sigma, phi, gamma, num_samples)
+        # Render
+        if renderer is not None:
+            pred_waveform = renderer(amplitude, tau, omega, sigma, phi, gamma, num_samples)
+        else:
+            # PyTorch fallback (slower)
+            pred_waveform = render_pytorch(amplitude, tau, omega, sigma, phi, gamma, 
+                                           num_samples, sample_rate, device)
         
         # Loss
         loss, loss_dict = loss_fn(
@@ -183,53 +306,150 @@ def train(args, config: Dict):
         if dc["densify_from_iter"] <= iteration < dc["densify_until_iter"]:
             if iteration % dc["densification_interval"] == 0 and iteration > 0:
                 stats = density_controller.densify_and_prune(model, optimizer)
-                if is_main and (stats["split"] > 0 or stats["cloned"] > 0):
-                    tqdm.write(f"[Density] iter={iteration}: split={stats['split']}, cloned={stats['cloned']}, total={model.num_atoms}")
         
         # Logging
-        if is_main:
-            visualizer.log_loss(iteration, loss_dict["total"])
-            if iteration % config["training"]["log_interval"] == 0:
-                pbar.set_postfix({"loss": f"{loss_dict['total']:.4f}", "atoms": model.num_atoms})
-            
-            if iteration % config["training"]["vis_interval"] == 0 and iteration > 0:
-                with torch.no_grad():
-                    visualizer.generate_all_visualizations(gt_waveform, pred_waveform.detach(), model, iteration)
+        if iteration % config["training"]["log_interval"] == 0:
+            pbar.set_postfix({"loss": f"{loss_dict['total']:.4f}", "atoms": model.num_atoms})
     
-    # Final
-    if is_main:
-        print("\n[CUDA-Ext] Complete!")
-        with torch.no_grad():
-            amplitude, tau, omega, sigma, phi, gamma = model.get_all_params()
-            pred = renderer(amplitude, tau, omega, sigma, phi, gamma, num_samples)
-            visualizer.generate_all_visualizations(gt_waveform, pred, model, max_iters, prefix="final")
+    # Final render
+    with torch.no_grad():
+        amplitude, tau, omega, sigma, phi, gamma = model.get_all_params()
+        if renderer is not None:
+            pred_waveform = renderer(amplitude, tau, omega, sigma, phi, gamma, num_samples)
+        else:
+            pred_waveform = render_pytorch(amplitude, tau, omega, sigma, phi, gamma,
+                                           num_samples, sample_rate, device)
+    
+    # Save reconstructed audio
+    audio_output = output_dir / f"{filename}_recon.wav"
+    torchaudio.save(str(audio_output), pred_waveform.unsqueeze(0).cpu(), sample_rate)
+    print(f"[Fit] Saved: {audio_output}")
+    
+    # Generate visualization
+    vis_dir = output_dir / "visualization"
+    vis_dir.mkdir(exist_ok=True)
+    
+    visualizer = Visualizer(str(vis_dir), sample_rate)
+    visualizer.plot_spectrogram_comparison(gt_waveform, pred_waveform, f"{filename}_vis")
+    print(f"[Fit] Saved visualization: {vis_dir}/{filename}_vis.png")
+    
+    # Compute metrics
+    metrics = compute_metrics(gt_waveform, pred_waveform, sample_rate)
+    metrics['final_atoms'] = model.num_atoms
+    metrics['duration_s'] = audio_duration
+    
+    return metrics
+
+
+def render_pytorch(
+    amplitude, tau, omega, sigma, phi, gamma,
+    num_samples, sample_rate, device
+) -> torch.Tensor:
+    """PyTorch fallback renderer (slower than CUDA)."""
+    t = torch.arange(num_samples, device=device, dtype=torch.float32) / sample_rate
+    output = torch.zeros(num_samples, device=device)
+    
+    for i in range(len(amplitude)):
+        A = amplitude[i]
+        tau_i = tau[i]
+        omega_i = omega[i]
+        sigma_i = sigma[i]
+        phi_i = phi[i]
+        gamma_i = gamma[i]
         
-        torch.save({
-            "iteration": max_iters,
-            "model_state": model.state_dict_full(),
-            "config": config,
-        }, output_dir / "checkpoint_final.pt")
+        t_centered = t - tau_i
+        envelope = torch.exp(-t_centered**2 / (2 * sigma_i**2 + 1e-8))
+        phase = 2 * 3.14159 * (omega_i * t_centered + 0.5 * gamma_i * t_centered**2) + phi_i
+        carrier = torch.cos(phase)
+        
+        output += A * envelope * carrier
     
-    cleanup_distributed()
+    return output
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="AudioGS Atom Fitting (Physics Pillars)")
+    parser.add_argument("--config", type=str, default="configs/atom_fitting_config.yaml")
+    parser.add_argument("--scan_files", action="store_true", help="Scan for test files")
+    args = parser.parse_args()
     
-    config_path = args.config
-    if not Path(config_path).is_absolute():
-        config_path = Path(__file__).parent.parent / config_path
-    
+    # Load config
+    config_path = PROJECT_ROOT / args.config
     config = load_config(str(config_path))
     
-    print("=" * 60)
-    print("Audio Gaussian Splatting (C++/CUDA EXTENSION)")
-    print("=" * 60)
-    if args.target_file:
-        print(f"Target: {args.target_file}")
-    print("=" * 60)
+    # Setup device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Main] Device: {device}")
     
-    train(args, config)
+    # Output directory
+    output_dir = PROJECT_ROOT / config["output"]["root_dir"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Main] Output: {output_dir}")
+    
+    # Find test files
+    global TEST_FILES
+    if args.scan_files or TEST_FILES[0] is None:
+        TEST_FILES = find_test_files_by_duration(
+            config["data"]["dataset_path"],
+            target_durations=[1.0, 3.0, 5.0],
+            sample_rate=config["data"]["sample_rate"],
+        )
+    
+    # Filter out None entries
+    test_files = [f for f in TEST_FILES if f is not None]
+    if len(test_files) == 0:
+        raise ValueError("No test files found. Check dataset path.")
+    
+    print(f"\n{'='*60}")
+    print("AudioGS Atom Fitting Benchmark (Physics Pillars Compliant)")
+    print(f"{'='*60}")
+    print(f"Files: {len(test_files)}")
+    print(f"{'='*60}\n")
+    
+    # Run fitting for each test file
+    all_metrics = []
+    
+    for audio_path in test_files:
+        try:
+            metrics = fit_single_audio(audio_path, config, output_dir, device)
+            metrics['file'] = Path(audio_path).name
+            all_metrics.append(metrics)
+        except Exception as e:
+            print(f"[Error] Failed on {audio_path}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Print summary table
+    print(f"\n{'='*80}")
+    print("BENCHMARK RESULTS")
+    print(f"{'='*80}")
+    print(f"{'File':<30} {'Duration':<10} {'SNR (dB)':<12} {'Mel-L1':<12} {'Atoms':<10}")
+    print(f"{'-'*80}")
+    
+    for m in all_metrics:
+        print(f"{m['file']:<30} {m['duration_s']:<10.2f} {m['snr_db']:<12.2f} {m['mel_l1']:<12.4f} {m['final_atoms']:<10}")
+    
+    print(f"{'='*80}")
+    
+    # Save metrics to file
+    metrics_path = output_dir / "metrics.txt"
+    with open(metrics_path, 'w') as f:
+        f.write("AudioGS Atom Fitting Benchmark Results\n")
+        f.write(f"Date: {datetime.now().isoformat()}\n")
+        f.write("="*60 + "\n\n")
+        
+        for m in all_metrics:
+            f.write(f"File: {m['file']}\n")
+            f.write(f"  Duration: {m['duration_s']:.2f}s\n")
+            f.write(f"  SNR: {m['snr_db']:.2f} dB\n")
+            f.write(f"  Mel-L1: {m['mel_l1']:.4f}\n")
+            f.write(f"  MSS Loss: {m['mss_loss']:.4f}\n")
+            f.write(f"  L1 Loss: {m['l1_loss']:.6f}\n")
+            f.write(f"  Final Atoms: {m['final_atoms']}\n")
+            f.write("\n")
+    
+    print(f"\n[Main] Metrics saved to: {metrics_path}")
+    print("[Main] Complete!")
 
 
 if __name__ == "__main__":

@@ -9,13 +9,13 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 
-# Import compiled CUDA extension
+# Import compiled CUDA extension (built into this package)
 try:
     from . import _C
     CUDA_EXT_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     CUDA_EXT_AVAILABLE = False
-    print("[cuda_gabor] Warning: CUDA extension not compiled. Run: pip install -e cuda_gabor/")
+    print(f"[cuda_gabor] Warning: CUDA extension not compiled. Run: pip install -e cuda_gabor/ (Error: {e})")
 
 
 class GaborRenderFunction(torch.autograd.Function):

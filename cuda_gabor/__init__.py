@@ -4,7 +4,9 @@ CUDA Gabor Renderer Extension
 High-performance Gabor atom rendering using custom CUDA kernels.
 """
 
-from .gabor_render import (
+# The extension _C is built into this package directly
+# Re-export from the inner cuda_gabor subpackage for API
+from .cuda_gabor.gabor_render import (
     GaborRendererCUDA,
     GaborRenderFunction,
     get_cuda_gabor_renderer,
