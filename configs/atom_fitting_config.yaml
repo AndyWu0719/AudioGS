@@ -1,63 +1,59 @@
-# Stage 00: Atom Fitting Config (Physics Pillars Compliant)
-# ==========================================================
-# Implements: Constant-Q Init, STFT Dominance, No Occlusion
+# Stage 00: Atom Fitting Config (Simplified Speech-Aware)
+# ========================================================
 
 # Data
 data:
   dataset_path: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R/train/train-clean-100"
   sample_rate: 24000
-  max_audio_length: 3.0  # Max audio duration (seconds)
+  max_audio_length: 3.0
 
-# Model (Coarse-to-Fine: Start sparse, grow via Density Control)
-# DYNAMIC DENSITY: max_atoms = duration_s × atoms_per_second
+# Model
 model:
-  initial_atoms_per_second: 1024  # Start sparse (1024/sec → 1024 for 1s, 5120 for 5s)
-  max_atoms_per_second: 4096      # Target density from Matching Pursuits literature
+  initial_atoms_per_second: 1024
+  max_atoms_per_second: 4096
 
-# Initialization (PILLAR 3: Constant-Q)
+# Initialization (Constant-Q)
 initialization:
-  constant_q_cycles: 4.0     # Number of cycles per atom (Gabor quality factor)
-  sigma_min: 0.001           # Minimum sigma (1ms for transients)
-  sigma_max: 0.100           # Maximum sigma (100ms for bass)
+  constant_q_cycles: 4.0
+  sigma_min: 0.001
+  sigma_max: 0.100
 
-# Training (PHASE-FIRST STRATEGY)
-# Higher LRs compensate for smaller gradients from low mel weight
+# Training
 training:
-  learning_rate: 0.01    # Increased from 0.0005
-  lr_amplitude: 0.005     # gemini fixed: reduced to prevent premature silencing
-  lr_position: 0.001      # gemini fixed: increased 10× to allow movement
-  lr_frequency: 0.003     # Increased from 0.0013
-  lr_sigma: 0.01          # Increased from 0.014
-  lr_phase: 0.015         # Increased from 0.0115
-  lr_chirp: 0.002         # Keep same
+  learning_rate: 0.01
+  lr_amplitude: 0.005
+  lr_position: 0.001
+  lr_frequency: 0.003
+  lr_sigma: 0.01
+  lr_phase: 0.015
+  lr_chirp: 0.002
   max_iters: 12000
   log_interval: 50
   vis_interval: 2000
 
-# Loss (PHASE-FIRST: Low Mel Weight forces waveform phase alignment)
-# CRITICAL: High mel weight ignores phase → metallic artifacts
-# Low mel (1.0) + STFT (1.0) + phase (1.0) = phase-coherent optimization
+# Loss (Balanced weights for speech)
 loss:
   fft_sizes: [2048, 1024, 512, 128]
   hop_sizes: [512, 256, 128, 32]
   win_lengths: [2048, 1024, 512, 128]
-  spectral_weight: 1.0       # Spectral Convergence + Log-Mag
-  mel_weight: 10.0            # LOW: Forces phase alignment
-  time_domain_weight: 0.1    # Waveform L1 for phase
-  phase_weight: 1.0          # Complex STFT for phase (RESTORED)
-  amp_reg_weight: 0.0001     # Light amplitude regularization (RESTORED)
-  pre_emp_weight: 2.0        # Pre-emphasis for HF detail (RESTORED)
+  spectral_weight: 1.0
+  mel_weight: 5.0              # RESTORED: higher for spectral envelope
+  time_domain_weight: 0.1
+  phase_weight: 1.0
+  amp_reg_weight: 0.0001
+  pre_emp_weight: 2.0
 
-# Density Control (PILLAR 5)
+# Density Control (Simplified)
 density_control:
   grad_threshold: 0.0002
-  sigma_split_threshold: 0.01  # 10ms threshold
-  prune_amplitude_threshold: 0.0005  # gemini fixed: lowered to prevent premature pruning
+  prune_amplitude_threshold: 0.0005  # LOWERED: conservative pruning
   densify_from_iter: 500
-  densify_until_iter: 10000          # RESTORED: original densify end
+  densify_until_iter: 10000
   densification_interval: 100
   sigma_diversity_weight: 0.001
-  enable_split: true                 # gemini fixed: enables high-freq regeneration
+  enable_split: true
+  cq_cycle_limit: 50.0
+  cq_reg_weight: 0.01          # LOWERED: linear penalty
 
 # Output
 output:

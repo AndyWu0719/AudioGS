@@ -1,39 +1,58 @@
 """
 Density Control for Audio Gaussian Splatting.
-Major Refactor: Fixed Optimizer Index Mapping, High-Freq Clone Prevention,
-Frequency-Adaptive Splitting (Cycle-Based Threshold).
+SIMPLIFIED VERSION - Speech-Aware Design.
+
+Design Principles:
+==================
+1. SIMPLE: Remove unnecessary complex mechanisms
+2. SPEECH-AWARE: Parameters match speech acoustics
+3. CONSERVATIVE: Prefer under-pruning over over-pruning
+4. GRADUAL: Use soft thresholds, avoid hard boundaries
+
+Removed Mechanisms (caused metric degradation):
+- Track B Physics Enforcement (destroyed valid harmonics)
+- Energy-Aware Pruning (removed consonant transients)
+- Late-Stage Freeze (prevented convergence)
+- Aggressive HF Clone Block (reduced HF detail)
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 import math
+
+# =====================================================
+# SPEECH-AWARE CONSTANTS
+# =====================================================
+# These are based on speech acoustics literature:
+# - Typical phoneme duration: 50-200ms
+# - Consonant transients: 5-30ms
+# - Fundamental frequency range: 80-400Hz
+
+SIGMA_MIN = 0.002         # 2ms - minimum for consonant transients
+SIGMA_MAX = 0.050         # 50ms - maximum for vowel formants
+Q_FACTOR = 4.0            # Gabor quality factor (standard in audio processing)
 
 
 class DensityController:
     """
-    Manages density control operations for AudioGS model.
+    Simplified density control for AudioGS.
     
-    REFACTOR: 
-    - Critical fix for optimizer state mapping during pruning
-    - Frequency-adaptive split thresholds (cycle-based, not fixed time)
+    Split/Clone/Prune logic designed for speech reconstruction:
+    - Split: Only gradient-driven, respects Constant-Q envelope
+    - Clone: Allowed for most frequencies (up to 80% Nyquist)
+    - Prune: Simple amplitude threshold, gentle HF penalty
     """
     
     def __init__(
         self,
         grad_threshold: float = 0.0002,
-        sigma_split_threshold: float = 0.01,  # Upper bound for adaptive threshold
-        prune_amplitude_threshold: float = 0.001,
-        clone_scale: float = 1.5,
+        prune_amplitude_threshold: float = 0.0005,
         max_num_atoms: int = 20000,
-        max_cycles_for_split: float = 40.0,  # NEW: Cycle-based split threshold
     ):
         self.grad_threshold = grad_threshold
-        self.sigma_split_threshold = sigma_split_threshold
         self.prune_amplitude_threshold = prune_amplitude_threshold
-        self.clone_scale = clone_scale
         self.max_num_atoms = max_num_atoms
-        self.max_cycles_for_split = max_cycles_for_split
         
     def get_densification_mask(
         self,
@@ -42,55 +61,33 @@ class DensityController:
         """
         Determine which atoms should be split vs cloned.
         
-        REFACTOR: 
-        - High-freq atoms (>40% Nyquist) are blocked from cloning
-        - FREQUENCY-ADAPTIVE SPLIT THRESHOLD (cycle-based, not fixed time)
+        SIMPLIFIED LOGIC:
+        =================
+        Split: High gradient AND sigma significantly exceeds Constant-Q expectation
+        Clone: High gradient AND small sigma AND frequency < 80% Nyquist
         
-        Physics Rationale:
-        ------------------
-        A fixed 10ms threshold means a 10kHz atom can have 100 cycles,
-        appearing as a horizontal striation (continuous tone) instead of
-        a transient. By using max_cycles / omega, we force HF atoms to
-        split earlier (e.g., 4ms at 10kHz = 40 cycles).
+        NO Track B physics enforcement - let the optimizer decide.
         """
-        # Get average accumulated gradients
         avg_grads = model.get_average_gradients()
-        
-        # High gradient atoms
         high_grad_mask = avg_grads > self.grad_threshold
         
-        # Get sigma and omega values
         sigma = model.sigma
-        omega = model.omega  # Hz
+        omega = model.omega
+        nyquist = model.nyquist_freq
         
-        # =====================================================
-        # FREQUENCY-ADAPTIVE SPLIT THRESHOLD (Cycle-Based)
-        # =====================================================
-        # An atom should not exceed max_cycles cycles
-        # adaptive_threshold = max_cycles / omega (in seconds)
-        # 
-        # Example at 10kHz (omega=10000):
-        #   adaptive_threshold = 40 / 10000 = 0.004s = 4ms
-        # Example at 100Hz (omega=100):
-        #   adaptive_threshold = 40 / 100 = 0.4s -> clamped to 10ms
+        # Constant-Q sigma: sigma = Q / omega
+        # This is the expected sigma for a "well-formed" Gabor atom
+        expected_sigma = (Q_FACTOR / (omega + 1e-8)).clamp(min=SIGMA_MIN, max=SIGMA_MAX)
         
-        adaptive_threshold = self.max_cycles_for_split / (omega + 1e-8)
+        # Split: sigma is 2x larger than expected (truly over-extended)
+        # This is conservative - only split obviously problematic atoms
+        split_threshold = expected_sigma * 2.0
+        split_mask = high_grad_mask & (sigma > split_threshold)
         
-        # Clamp to reasonable bounds:
-        # - Lower: 2ms (don't create sub-hop-size atoms)
-        # - Upper: sigma_split_threshold (default 10ms for low freqs)
-        adaptive_threshold = adaptive_threshold.clamp(
-            min=0.002,  # 2ms minimum
-            max=self.sigma_split_threshold
-        )
-        
-        # Split: high gradient AND sigma exceeds adaptive (cycle-based) threshold
-        split_mask = high_grad_mask & (sigma > adaptive_threshold)
-        
-        # Clone: high gradient AND small sigma AND NOT high frequency
-        # High-freq atoms (>40% Nyquist) should Split or Prune, NOT Clone
-        high_freq_mask = omega > 0.4 * model.nyquist_freq
-        clone_mask = high_grad_mask & (sigma <= adaptive_threshold) & (~high_freq_mask)
+        # Clone: sigma is within expectation, NOT high frequency
+        # Relaxed HF limit: 80% Nyquist (was 40%)
+        high_freq_mask = omega > 0.8 * nyquist
+        clone_mask = high_grad_mask & (sigma <= expected_sigma * 1.5) & (~high_freq_mask)
         
         return split_mask, clone_mask
     
@@ -98,7 +95,12 @@ class DensityController:
         """
         Determine which atoms should be pruned (kept=True).
         
-        Frequency-aware pruning - high-freq atoms have stricter threshold.
+        SIMPLE AMPLITUDE-BASED PRUNING:
+        ==============================
+        - Keep atoms with amplitude >= threshold
+        - Gentle penalty for very high frequencies (>90% Nyquist): 1.5x threshold
+        
+        NO energy-aware pruning - it was destroying consonant transients.
         """
         amplitude = model.amplitude
         omega = model.omega
@@ -106,83 +108,88 @@ class DensityController:
         
         base_threshold = self.prune_amplitude_threshold
         
-        # High-freq atoms (>70% Nyquist) have 2× stricter threshold
-        high_freq_mask = omega > 0.7 * nyquist
-        adaptive_threshold = torch.where(
-            high_freq_mask,
-            base_threshold * 2.0,
+        # Only penalize VERY high frequencies (>90% Nyquist)
+        # These are likely to be noise, not speech content
+        very_high_freq_mask = omega > 0.9 * nyquist
+        threshold = torch.where(
+            very_high_freq_mask,
+            base_threshold * 1.5,  # Gentle 1.5x penalty (was 2x)
             base_threshold
         )
         
-        keep_mask = amplitude >= adaptive_threshold
+        keep_mask = amplitude >= threshold
         return keep_mask
     
     def densify_and_prune(
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
-        do_split: bool = False,
+        do_split: bool = True,
         do_clone: bool = True,
         do_prune: bool = True,
     ) -> Dict[str, int]:
         """
-        Perform density control with proper optimizer state mapping.
+        Perform density control.
         
-        REFACTOR: Uses keep_indices from remove_atoms for correct momentum copying.
+        NO late-stage freeze - let the system naturally stabilize.
+        Gradient priority when budget is tight.
         """
         stats = {"split": 0, "cloned": 0, "pruned": 0}
         current_atoms = model.num_atoms
         
-        # 1. Get densification masks
+        # Get masks
         split_mask, clone_mask = self.get_densification_mask(model)
+        avg_grads = model.get_average_gradients()
         
         split_indices = torch.where(split_mask)[0] if do_split else torch.tensor([], device=model.device, dtype=torch.long)
         clone_indices = torch.where(clone_mask)[0] if do_clone else torch.tensor([], device=model.device, dtype=torch.long)
         
-        # 2. Budget Calculation
+        # Budget calculation
         n_split = len(split_indices)
         n_clone = len(clone_indices)
         
-        cost_per_split = 2 
-        cost_per_clone = 1
-        
-        projected_add = n_split * cost_per_split + n_clone * cost_per_clone
         remaining_budget = self.max_num_atoms - current_atoms
+        projected_add = n_split * 2 + n_clone
         
-        # 3. Budget Saturation / Truncation
+        # Budget truncation with gradient priority
         if remaining_budget <= 0:
             split_indices = torch.tensor([], device=model.device, dtype=torch.long)
             clone_indices = torch.tensor([], device=model.device, dtype=torch.long)
         elif projected_add > remaining_budget:
-            split_cost = n_split * cost_per_split
-            if split_cost > remaining_budget:
-                allowed_splits = remaining_budget // cost_per_split
-                split_indices = split_indices[:allowed_splits]
+            # Prioritize by gradient (higher gradient = more important)
+            if n_split * 2 > remaining_budget:
+                allowed_splits = remaining_budget // 2
+                if allowed_splits > 0 and len(split_indices) > 0:
+                    grads = avg_grads[split_indices]
+                    sorted_idx = torch.argsort(grads, descending=True)
+                    split_indices = split_indices[sorted_idx[:allowed_splits]]
+                else:
+                    split_indices = torch.tensor([], device=model.device, dtype=torch.long)
                 clone_indices = torch.tensor([], device=model.device, dtype=torch.long)
             else:
-                remaining_after_split = remaining_budget - split_cost
-                allowed_clones = remaining_after_split // cost_per_clone
-                clone_indices = clone_indices[:allowed_clones]
-                
-        # 4. Execute Operations
-        # IMPORTANT: Capture old params BEFORE modification
+                remaining = remaining_budget - n_split * 2
+                if remaining > 0 and len(clone_indices) > 0:
+                    grads = avg_grads[clone_indices]
+                    sorted_idx = torch.argsort(grads, descending=True)
+                    clone_indices = clone_indices[sorted_idx[:remaining]]
+                else:
+                    clone_indices = torch.tensor([], device=model.device, dtype=torch.long)
+        
+        # Execute operations
         old_params = self._get_param_dict(model)
         any_changes = False
         
-        # Execute Split
         if len(split_indices) > 0:
             model.split_atoms_by_indices(split_indices)
             stats["split"] = len(split_indices)
             any_changes = True
 
-        # Execute Clone
         if len(clone_indices) > 0:
             num_cloned = model.clone_atoms_by_indices(clone_indices)
             stats["cloned"] = num_cloned
             if num_cloned > 0:
                 any_changes = True
         
-        # Execute Prune and capture keep_indices
         keep_indices = None
         if do_prune:
             prune_mask = self.get_prune_mask(model)
@@ -192,7 +199,6 @@ class DensityController:
                 stats["pruned"] = num_to_prune
                 any_changes = True
 
-        # 5. Update Optimizer with CORRECT index mapping
         if any_changes:
             self._update_optimizer_state(model, optimizer, old_params, keep_indices)
             model.reset_gradient_accumulators()
@@ -205,7 +211,7 @@ class DensityController:
             "tau": model._tau,
             "omega_logit": model._omega_logit,
             "sigma_logit": model._sigma_logit,
-            "phi_vector": model._phi_vector,  # 2D
+            "phi_vector": model._phi_vector,
             "gamma": model._gamma,
         }
     
@@ -216,18 +222,10 @@ class DensityController:
         old_params: Dict[str, nn.Parameter],
         keep_indices: Optional[torch.Tensor] = None,
     ):
-        """
-        Update optimizer state with CORRECT index mapping after pruning.
-        
-        CRITICAL FIX: When atoms [0, 2, 4] survive pruning, we must copy
-        momentum states from indices [0, 2, 4], NOT [0, 1, 2]!
-        
-        Also handles: keep_indices may contain NEW atom indices (from clone/split)
-        that don't exist in old optimizer state - these get zero momentum.
-        """
+        """Update optimizer state with correct index mapping."""
         new_params = self._get_param_dict(model)
         
-        # 1. Capture current Learning Rates from the old optimizer
+        # Capture LRs
         old_param_id_to_lr = {}
         for group in optimizer.param_groups:
             for p in group['params']:
@@ -237,7 +235,7 @@ class DensityController:
         for name, old_tensor in old_params.items():
             name_to_lr[name] = old_param_id_to_lr.get(id(old_tensor), 0.001)
         
-        # 2. Backup old optimizer states (Momentum)
+        # Backup states
         old_states = {}
         for group in optimizer.param_groups:
             for p in group["params"]:
@@ -249,7 +247,7 @@ class DensityController:
             if id(old_param) in old_states:
                 old_param_states[name] = old_states[id(old_param)]
         
-        # 3. Rebuild Optimizer Groups (IN-PLACE)
+        # Rebuild
         optimizer.param_groups = []
         optimizer.state = {}
         
@@ -257,39 +255,21 @@ class DensityController:
             lr = name_to_lr.get(name, 0.001)
             optimizer.add_param_group({"params": [param], "lr": lr})
             
-            # Restore momentum state with CORRECT index mapping
             if name in old_param_states:
                 old_state = old_param_states[name]
                 if "exp_avg" in old_state:
                     old_exp_avg = old_state["exp_avg"]
                     old_exp_avg_sq = old_state["exp_avg_sq"]
-                    
-                    # Check if this is a 2D parameter (phi_vector)
                     is_2d = old_exp_avg.dim() == 2
                     
                     if keep_indices is not None:
-                        # CRITICAL FIX: keep_indices may contain indices of newly added atoms
-                        # (from clone/split) which don't exist in old_exp_avg!
-                        # 
-                        # Example: After clone adds 5 atoms, keep_indices might be [0, 2, 100, 101, 102]
-                        # but old_exp_avg only has 100 elements. Accessing old_exp_avg[100] crashes!
-                        #
-                        # Solution: Filter to only valid old indices, zero-init new atoms
-                        
                         old_len = old_exp_avg.shape[0]
                         valid_mask = keep_indices < old_len
                         valid_old_indices = keep_indices[valid_mask]
                         
-                        # Initialize new state tensors with zeros
-                        if is_2d:
-                            new_exp_avg = torch.zeros_like(param)
-                            new_exp_avg_sq = torch.zeros_like(param)
-                        else:
-                            new_exp_avg = torch.zeros_like(param)
-                            new_exp_avg_sq = torch.zeros_like(param)
+                        new_exp_avg = torch.zeros_like(param)
+                        new_exp_avg_sq = torch.zeros_like(param)
                         
-                        # Copy momentum only for atoms that existed in old optimizer
-                        # Map: valid_old_indices[i] in old → i in new (for surviving old atoms)
                         n_valid = len(valid_old_indices)
                         if n_valid > 0:
                             if is_2d:
@@ -298,21 +278,14 @@ class DensityController:
                             else:
                                 new_exp_avg[:n_valid] = old_exp_avg[valid_old_indices]
                                 new_exp_avg_sq[:n_valid] = old_exp_avg_sq[valid_old_indices]
-                        
-                        # New atoms (from clone/split) get zero momentum - already handled by zeros_like
                     else:
-                        # No pruning happened - just atoms were added (clone/split only)
-                        # Copy old state for original atoms, zero-init new ones
                         n_copy = min(old_exp_avg.shape[0], param.shape[0])
-                        
+                        new_exp_avg = torch.zeros_like(param)
+                        new_exp_avg_sq = torch.zeros_like(param)
                         if is_2d:
-                            new_exp_avg = torch.zeros_like(param)
-                            new_exp_avg_sq = torch.zeros_like(param)
                             new_exp_avg[:n_copy, :] = old_exp_avg[:n_copy, :]
                             new_exp_avg_sq[:n_copy, :] = old_exp_avg_sq[:n_copy, :]
                         else:
-                            new_exp_avg = torch.zeros_like(param)
-                            new_exp_avg_sq = torch.zeros_like(param)
                             new_exp_avg[:n_copy] = old_exp_avg[:n_copy]
                             new_exp_avg_sq[:n_copy] = old_exp_avg_sq[:n_copy]
                     
@@ -324,26 +297,20 @@ class DensityController:
 
 
 class AdaptiveDensityController(DensityController):
-    """Adaptive density controller with dynamic thresholds."""
+    """Adaptive controller with gradual threshold decay."""
     
     def __init__(
         self,
         grad_threshold: float = 0.0002,
-        sigma_split_threshold: float = 0.01,
-        prune_amplitude_threshold: float = 0.001,
-        clone_scale: float = 1.5,
+        prune_amplitude_threshold: float = 0.0005,
         max_num_atoms: int = 20000,
         warmup_iters: int = 100,
-        decay_factor: float = 0.99,
-        max_cycles_for_split: float = 40.0,  # NEW
+        decay_factor: float = 0.995,  # Slower decay
     ):
         super().__init__(
             grad_threshold=grad_threshold,
-            sigma_split_threshold=sigma_split_threshold,
             prune_amplitude_threshold=prune_amplitude_threshold,
-            clone_scale=clone_scale,
             max_num_atoms=max_num_atoms,
-            max_cycles_for_split=max_cycles_for_split,
         )
         self.warmup_iters = warmup_iters
         self.decay_factor = decay_factor
@@ -353,10 +320,11 @@ class AdaptiveDensityController(DensityController):
     def update_thresholds(self, loss: float):
         self.iteration += 1
         if self.iteration > self.warmup_iters:
-            self.grad_threshold = max(
-                self.initial_grad_threshold * (self.decay_factor ** (self.iteration - self.warmup_iters)),
-                1e-5
+            decayed = self.initial_grad_threshold * (
+                self.decay_factor ** (self.iteration - self.warmup_iters)
             )
+            # Floor at 1e-5 for stability
+            self.grad_threshold = max(decayed, 1e-5)
 
 
 def rebuild_optimizer_from_model(
@@ -365,9 +333,7 @@ def rebuild_optimizer_from_model(
     lr_config: Optional[Dict[str, float]] = None,
     **optimizer_kwargs,
 ) -> torch.optim.Optimizer:
-    """Helper to create initial optimizer."""
     if lr_config is None:
         lr_config = {}
-    
     param_groups = model.get_optimizer_param_groups(lr_config)
     return optimizer_class(param_groups, **optimizer_kwargs)

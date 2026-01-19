@@ -276,20 +276,18 @@ def fit_single_audio(
         optimizer, milestones=[4000, 7000, 9000], gamma=0.5
     )
     
-    # Density Controller with DYNAMIC max_atoms and frequency-adaptive splitting
+    # Density Controller - Simplified speech-aware design
     dc = config["density_control"]
     density_controller = AdaptiveDensityController(
         grad_threshold=dc["grad_threshold"],
-        sigma_split_threshold=dc["sigma_split_threshold"],
         prune_amplitude_threshold=dc["prune_amplitude_threshold"],
         max_num_atoms=max_num_atoms,
-        max_cycles_for_split=dc.get("max_cycles_for_split", 40.0),  # NEW
     )
-    enable_split = dc.get("enable_split", True)  # Enable split by default now
+    enable_split = dc.get("enable_split", True)
     
-    # Constant-Q Regularization parameters
-    cq_cycle_limit = dc.get("cq_cycle_limit", 50.0)  # Soft limit on cycles
-    cq_reg_weight = dc.get("cq_reg_weight", 0.01)    # Penalty weight
+    # Linear CQ Regularization (soft penalty, NOT exponential barrier)
+    cq_cycle_limit = dc.get("cq_cycle_limit", 50.0)
+    cq_reg_weight = dc.get("cq_reg_weight", 0.01)  # Gentle weight
     
     # Training loop
     pbar = tqdm(range(max_iters), desc=f"Fitting {filename}", leave=False)
@@ -322,16 +320,12 @@ def fit_single_audio(
         )
         
         # =====================================================
-        # CONSTANT-Q REGULARIZATION LOSS (NEW)
+        # LINEAR CQ REGULARIZATION (Soft penalty)
         # =====================================================
-        # Penalizes atoms that exceed the cycle limit (non-physical)
-        # An atom with sigma=10ms at omega=10kHz has 100 cycles = horizontal line
-        # This soft penalty prevents the optimizer from "cheating" on L1 loss
-        # by creating long atoms that don't represent transients properly.
-        #
-        # Formula: cq_reg = weight * mean(relu(sigma * omega - cycle_limit))
+        # Gently penalize atoms exceeding cycle limit
+        # Linear is more stable than exponential barrier
         
-        current_cycles = sigma * omega  # cycles per atom
+        current_cycles = sigma * omega
         cq_reg_loss = cq_reg_weight * F.relu(current_cycles - cq_cycle_limit).mean()
         loss = loss + cq_reg_loss
         loss_dict['cq_reg'] = cq_reg_loss.item()
@@ -344,7 +338,7 @@ def fit_single_audio(
         optimizer.step()
         scheduler.step()
         
-        # Density control with frequency-adaptive splitting
+        # Density control (simplified, no late-stage freeze)
         density_controller.update_thresholds(loss.item())
         if dc["densify_from_iter"] <= iteration < dc["densify_until_iter"]:
             if iteration % dc["densification_interval"] == 0 and iteration > 0:
