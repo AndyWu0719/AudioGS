@@ -327,8 +327,16 @@ def fit_single_audio(
         
         current_cycles = sigma * omega
         cq_reg_loss = cq_reg_weight * F.relu(current_cycles - cq_cycle_limit).mean()
-        loss = loss + cq_reg_loss
+        
+        # Boundary Repulsion Loss (NEW)
+        # Penalize atoms approaching the 99% Nyquist limit
+        # Formula: 0.01 * exp((omega / limit) * 20 - 20) -> Steeper penalty
+        freq_limit = 0.99 * model.nyquist_freq
+        boundary_loss = 0.01 * torch.exp((omega / freq_limit) * 20 - 20).mean()
+        
+        loss = loss + cq_reg_loss + boundary_loss
         loss_dict['cq_reg'] = cq_reg_loss.item()
+        loss_dict['boundary'] = boundary_loss.item()
         
         # Backward
         optimizer.zero_grad()
@@ -353,7 +361,7 @@ def fit_single_audio(
         if iteration % config["training"]["log_interval"] == 0:
             # Count HF atoms for debugging
             omega_np = omega.detach().cpu().numpy()
-            hf_count = (omega_np > 0.85 * model.nyquist_freq).sum()
+            hf_count = (omega_np > 0.95 * model.nyquist_freq).sum()
             pbar.set_postfix({
                 "L": f"{loss_dict['total']:.3f}",
                 "mel": f"{loss_dict['mel']:.2f}",

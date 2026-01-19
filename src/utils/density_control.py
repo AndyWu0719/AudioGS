@@ -108,13 +108,19 @@ class DensityController:
         # Aggressive HF pruning: > 85% Nyquist gets 3x threshold
         # This removes the HF band artifact from sigmoid saturation
         very_high_freq_mask = omega > 0.85 * nyquist
-        threshold = torch.where(
-            very_high_freq_mask,
-            base_threshold * 3.0,  # Strong 3x penalty
-            base_threshold
-        )
         
-        keep_mask = amplitude >= threshold
+        # Calculate thresholds
+        adaptive_threshold = torch.ones_like(amplitude) * base_threshold
+        
+        # Strong 3x penalty for >85% Nyquist
+        adaptive_threshold[very_high_freq_mask] = base_threshold * 3.0
+        
+        # Aggressive Boundary Pruning (NEW)
+        # Kill atoms stuck at the ceiling (> 82% Nyquist) with 10x penalty
+        ceiling_mask = omega > 0.82 * nyquist
+        adaptive_threshold[ceiling_mask] = base_threshold * 10.0
+        
+        keep_mask = amplitude >= adaptive_threshold
         return keep_mask
     
     def densify_and_prune(

@@ -129,8 +129,8 @@ class AudioGSModel(nn.Module):
             # Assign to parameters
             self._tau.data = taus
             
-            # Convert omega (Hz) to logit (using 85% Nyquist scaling to match property)
-            max_omega = 0.85 * self.nyquist_freq
+            # Convert omega (Hz) to logit (using 99% Nyquist scaling to match property)
+            max_omega = 0.99 * self.nyquist_freq
             omega_normalized = (omegas / max_omega).clamp(1e-5, 1 - 1e-5)
             self._omega_logit.data = torch.log(omega_normalized / (1 - omega_normalized))
             
@@ -265,8 +265,8 @@ class AudioGSModel(nn.Module):
         for i, idx in enumerate(harmonic_indices):
             if is_voiced[idx] and f0_at_taus[idx] > 50:
                 f0_hz = f0_at_taus[idx]
-                # Limit to 80% Nyquist to prevent HF band artifact
-                max_harmonic = int(0.80 * self.nyquist_freq / f0_hz)
+                # Limit to 99% Nyquist
+                max_harmonic = int(0.99 * self.nyquist_freq / f0_hz)
                 if max_harmonic >= 2:
                     # Weighted selection: prefer lower harmonics (more energy in speech)
                     h_weights = np.array([1.0/h for h in range(2, max_harmonic + 1)])
@@ -279,9 +279,9 @@ class AudioGSModel(nn.Module):
                 # Unvoiced: mid-range
                 omegas[idx] = np.random.uniform(2000, 6000)
         
-        # Random atoms (20%): spectrum coverage up to 80% Nyquist
+        # Random atoms (20%): spectrum coverage up to 99% Nyquist
         for idx in random_indices:
-            omegas[idx] = np.random.uniform(100, 0.80 * self.nyquist_freq)
+            omegas[idx] = np.random.uniform(100, 0.99 * self.nyquist_freq)
         
         # =====================================================
         # Phase Initialization from STFT (Bilinear Interpolation)
@@ -401,8 +401,8 @@ class AudioGSModel(nn.Module):
         num_freq_bins, num_frames = mag.shape
         freqs = torch.linspace(0, self.nyquist_freq, num_freq_bins, device=self.device)
         
-        # Limit to 80% Nyquist to prevent HF band artifact
-        max_bin = int(num_freq_bins * 0.80)
+        # Limit to 99% Nyquist
+        max_bin = int(num_freq_bins * 0.99)
         
         num_atoms = len(taus)
         omegas = torch.zeros(num_atoms, device=self.device)
@@ -441,8 +441,8 @@ class AudioGSModel(nn.Module):
 
     @property
     def omega(self) -> torch.Tensor:
-        # Limit to 85% Nyquist to prevent HF band artifact from sigmoid saturation
-        return torch.sigmoid(self._omega_logit) * 0.85 * self.nyquist_freq
+        # Scale to 99% Nyquist to allow full frequency range
+        return torch.sigmoid(self._omega_logit) * 0.99 * self.nyquist_freq
 
     @property
     def sigma(self) -> torch.Tensor: 
@@ -554,8 +554,8 @@ class AudioGSModel(nn.Module):
         Clone atoms using JITTERED HARMONIC STACKING for additive synthesis.
         
         REFACTOR: 
-        - Uses real sigma / 2 -> logit conversion instead of logit - 0.693
-        - No high-freq capping (let density_control handle it)
+        - Discards clones that exceed 95% Nyquist (prevents HF pile-up)
+        - Uses real sigma / 2 -> logit conversion
         """
         if len(indices) == 0: 
             return 0
@@ -564,39 +564,45 @@ class AudioGSModel(nn.Module):
             # Get parent frequencies (in Hz)
             parent_omega_hz = self.omega[indices]
             
-            # Compute target harmonic with JITTER for inharmonicity handling
+            # Compute target harmonic with JITTER
             jitter = torch.empty_like(parent_omega_hz).uniform_(0.95, 1.05)
             target_omega_hz = parent_omega_hz * 2.0 * jitter
             
-            # Safety clamp to 90% Nyquist
-            max_omega = self.nyquist_freq * 0.90
-            target_omega_hz = torch.clamp(target_omega_hz, min=50.0, max=max_omega)
+            # FILTER: Discard atoms exceeding 95% Nyquist
+            # This prevents "bright band" artifact at the boundary
+            valid_mask = target_omega_hz < (0.95 * self.nyquist_freq)
+            
+            if not valid_mask.any():
+                return 0
+                
+            # Filter valid indices and values
+            valid_target_omega = target_omega_hz[valid_mask]
+            valid_indices = indices[valid_mask]
             
             # Convert target omega to logit space
-            omega_normalized = (target_omega_hz / self.nyquist_freq).clamp(1e-5, 1 - 1e-5)
+            omega_normalized = (valid_target_omega / self.nyquist_freq).clamp(1e-5, 1 - 1e-5)
             new_omega_logit = torch.log(omega_normalized / (1 - omega_normalized))
             
-            # Clone other parameters
-            new_amp = self._amplitude_logit.data[indices].clone() - 0.5
-            new_tau = self._tau.data[indices].clone()
+            # Clone other parameters (filtered)
+            new_amp = self._amplitude_logit.data[valid_indices].clone() - 0.5
+            new_tau = self._tau.data[valid_indices].clone()
             
-            # Add tau jitter to break positional clustering
-            tau_jitter = torch.randn_like(new_tau) * 0.005  # ±5ms random displacement
+            # Add tau jitter
+            tau_jitter = torch.randn_like(new_tau) * 0.005
             new_tau = (new_tau + tau_jitter).clamp(0, self.audio_duration - 1e-6)
             
-            # REFACTOR: CONSTANT-Q sigma using real values
-            # Halve real sigma → then convert back to logit
-            parent_sigma_real = self.sigma[indices]
+            # Sigma logic
+            parent_sigma_real = self.sigma[valid_indices]
             new_sigma_real = parent_sigma_real / 2.0
-            new_sigma_real = new_sigma_real.clamp(min=0.0005)  # Min 0.5ms
+            new_sigma_real = new_sigma_real.clamp(min=0.0005)
             new_sigma = torch.log(new_sigma_real)
             
-            # Clone phi_vector (2D)
-            new_phi_vector = self._phi_vector.data[indices].clone()
-            new_gamma = self._gamma.data[indices].clone()
+            # Clone vectors
+            new_phi_vector = self._phi_vector.data[valid_indices].clone()
+            new_gamma = self._gamma.data[valid_indices].clone()
             
         self.add_atoms(new_amp, new_tau, new_omega_logit, new_sigma, new_phi_vector, new_gamma)
-        return len(indices)
+        return len(valid_indices)
 
     def split_atoms_by_indices(self, indices, scale_factor=1.6):
         """Split atoms into two with smaller sigma and displaced tau."""
