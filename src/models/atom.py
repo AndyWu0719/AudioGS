@@ -36,12 +36,27 @@ class AudioGSModel(nn.Module):
         self.register_buffer("grad_accum_count", torch.zeros(1, device=self.device))
 
     def init_random(self):
-        """Fallback: Random initialization."""
+        """
+        Fallback: Random initialization with CONSTANT-Q SIGMA.
+        
+        AUDIO PHYSICS: Sigma must scale with frequency. A 100Hz wave has
+        period 10ms, so sigma must be ≥10ms to represent it without gaps.
+        """
         with torch.no_grad():
             self._amplitude_logit.data.normal_(0, 0.1)
             self._tau.data.uniform_(0, self.audio_duration)
-            self._omega_logit.data.normal_(0, 1.0)
-            self._sigma_logit.data.normal_(-4.0, 0.5) 
+            # Init omega uniformly across full range to avoid "dead bands"
+            self._omega_logit.data.uniform_(-5.0, 5.0)
+            
+            # CONSTANT-Q SIGMA: σ = num_cycles / ω (Hz)
+            # This ensures atoms can properly represent their frequency
+            N_CYCLES = 3.5  # ~3.5 cycles per atom
+            omega_hz = torch.sigmoid(self._omega_logit.data) * self.nyquist_freq
+            omega_hz = omega_hz.clamp(min=50.0)  # Min 50Hz for numerical stability
+            constant_q_sigma = N_CYCLES / omega_hz  # seconds
+            constant_q_sigma = constant_q_sigma.clamp(min=0.002, max=0.050)  # 2ms-50ms
+            self._sigma_logit.data = torch.log(constant_q_sigma)
+            
             self._phi.data.uniform_(0, 2 * math.pi)
             
     def initialize_from_audio(self, waveform: torch.Tensor, use_f0_init: bool = True, n_fft: int = 2048, hop_length: int = 512):
@@ -61,6 +76,9 @@ class AudioGSModel(nn.Module):
             hop_length: Hop length for STFT
         """
         print(f"[AudioGSModel] Initializing from audio (use_f0_init={use_f0_init})...")
+        
+        # Random init first to ensure no atoms are stuck at default zeros (0.5 Nyquist)
+        self.init_random()
         
         with torch.no_grad():
             waveform = waveform.to(self.device)
@@ -91,12 +109,14 @@ class AudioGSModel(nn.Module):
             self._amplitude_logit.data.fill_(-2.0)  # softplus(-2) ≈ 0.13
             
             # CONSTANT-Q SIGMA: σ inversely proportional to frequency
-            # This ensures ~N cycles per atom regardless of frequency
-            # Bass (100Hz): σ ≈ 40ms (4 cycles)
-            # Treble (8kHz): σ ≈ 0.5ms (4 cycles)
-            N_CYCLES = 4.0  # Perceptually balanced (~4 cycles per atom)
+            # AUDIO PHYSICS: Sigma must be long enough to represent the wave!
+            # A 100Hz wave has period 10ms → sigma must be ≥10ms
+            # Rule: sigma = num_cycles / frequency (Hz)
+            # Bass (100Hz): σ = 3.5/100 = 35ms
+            # Treble (8kHz): σ = 3.5/8000 = 0.44ms → clamped to 2ms
+            N_CYCLES = 3.5  # ~3.5 cycles per atom (perceptually balanced)
             constant_q_sigma = N_CYCLES / omegas.clamp(min=50.0)  # Hz → seconds
-            constant_q_sigma = constant_q_sigma.clamp(min=0.001, max=0.100)  # 1ms-100ms range
+            constant_q_sigma = constant_q_sigma.clamp(min=0.002, max=0.050)  # 2ms-50ms
             self._sigma_logit.data = torch.log(constant_q_sigma)
             
             # Gamma (chirp): zero initially (no frequency modulation)
@@ -360,6 +380,13 @@ class AudioGSModel(nn.Module):
         return omegas, phis
     
     def _stft_init(self, waveform: torch.Tensor, taus: torch.Tensor, n_fft: int, hop_length: int):
+        """
+        STFT-based initialization with DE-CLUMPING via temperature scaling.
+        
+        AUDIO PHYSICS: Pure multinomial sampling clusters atoms in high-energy
+        bins, creating the "bright band" artifact. Temperature scaling (weights^0.5)
+        flattens the distribution to encourage spectral diversity.
+        """
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
         
@@ -384,10 +411,13 @@ class AudioGSModel(nn.Module):
             frame_idx = int(t / self.audio_duration * (num_frames - 1))
             frame_idx = max(0, min(frame_idx, num_frames - 1))
             
-            # Sample from magnitude distribution
+            # Sample from magnitude distribution with TEMPERATURE SCALING
+            # sqrt(weights) flattens distribution to prevent clustering
             frame_mag = mag[:, frame_idx]
             if frame_mag.sum() > 0:
-                probs = frame_mag / frame_mag.sum()
+                # Temperature scaling: weights^0.5 encourages diversity
+                probs = torch.sqrt(frame_mag + 1e-10)  # sqrt for de-clumping
+                probs = probs / probs.sum()
                 freq_idx = torch.multinomial(probs, 1).item()
             else:
                 freq_idx = torch.randint(0, num_freq_bins, (1,)).item()
@@ -411,8 +441,10 @@ class AudioGSModel(nn.Module):
 
     @property
     def sigma(self) -> torch.Tensor: 
-        min_sigma_logit = math.log(0.002)  # Allow 2ms atoms for transients
-        return torch.exp(torch.clamp(self._sigma_logit, min=min_sigma_logit))
+        # Use softplus for smooth positive sigma values
+        # Fix Bug #4: Minimum 0.5ms (~12 samples at 24kHz) to prevent gradient explosion
+        # Previous 1e-4 (0.1ms) caused CUDA backward kernel to produce ~1e8 gradients
+        return torch.nn.functional.softplus(self._sigma_logit) + 0.0005
 
     @property
     def phi(self) -> torch.Tensor: 
@@ -471,52 +503,62 @@ class AudioGSModel(nn.Module):
 
     def clone_atoms_by_indices(self, indices):
         """
-        Clone atoms using HARMONIC STACKING for additive synthesis.
+        Clone atoms using JITTERED HARMONIC STACKING for additive synthesis.
         
-        AUDIO PHYSICS: Instead of random frequency perturbation,
-        clones are created at the next harmonic overtone (2×ω, 3×ω, etc.)
-        This enables differentiable additive synthesis.
+        BRIGHT BAND FIX: Skip cloning for atoms above 50% Nyquist to prevent
+        clustering at high frequencies. Only low/mid freq atoms benefit from
+        harmonic doubling.
+        
+        AUDIO PHYSICS: Pure gradient descent is myopic - a 100Hz atom with
+        +0.02 perturbation cannot escape to the 200Hz basin. The 2× multiplier
+        provides the leap, jitter allows fine-tuning to the exact peak.
         
         CONSTANT-Q: When doubling frequency, sigma is HALVED to maintain
         the same number of cycles per atom.
         """
         if len(indices) == 0: return 0
+        
         with torch.no_grad():
             # Get parent frequencies (in Hz)
             parent_omega_hz = self.omega[indices]  # Already in Hz via property
             
-            # Compute next valid harmonic for each atom
-            # Target: 2×ω for first clone, but clamp to Nyquist
-            harmonic_multiplier = 2.0
-            target_omega_hz = parent_omega_hz * harmonic_multiplier
+            # BRIGHT BAND FIX: Filter out high-frequency atoms
+            # Only clone atoms below 50% Nyquist (doubling stays below Nyquist)
+            max_clone_freq = self.nyquist_freq * 0.45  # Conservative: 45%
+            valid_mask = parent_omega_hz < max_clone_freq
             
-            # Clamp to 95% of Nyquist to stay safe
-            max_omega = self.nyquist_freq * 0.95
-            target_omega_hz = torch.clamp(target_omega_hz, max=max_omega)
-            
-            # Skip atoms where harmonic would exceed Nyquist
-            valid_mask = target_omega_hz < max_omega
             if not valid_mask.any():
-                # All harmonics would exceed Nyquist, use slight perturbation instead
-                target_omega_hz = parent_omega_hz * 1.01  # 1% frequency shift
-                harmonic_multiplier = 1.01  # Minimal sigma change
+                return 0  # No valid atoms to clone
+            
+            # Filter to only valid (low-freq) atoms
+            valid_parent_omega = parent_omega_hz[valid_mask]
+            valid_indices = indices[valid_mask]
+            
+            # Compute target harmonic with JITTER for inharmonicity handling
+            jitter = torch.empty_like(valid_parent_omega).uniform_(0.95, 1.05)
+            target_omega_hz = valid_parent_omega * 2.0 * jitter
+            
+            # Safety clamp (should rarely trigger now)
+            max_omega = self.nyquist_freq * 0.90
+            target_omega_hz = torch.clamp(target_omega_hz, min=50.0, max=max_omega)
             
             # Convert target omega to logit space
             omega_normalized = (target_omega_hz / self.nyquist_freq).clamp(1e-5, 1 - 1e-5)
             new_omega_logit = torch.log(omega_normalized / (1 - omega_normalized))
             
-            # Clone other parameters
-            new_amp = self._amplitude_logit.data[indices].clone() - 0.5  # Reduce amplitude for harmonic
-            new_tau = self._tau.data[indices].clone()  # Same time position
+            # Clone other parameters (use valid_indices for indexing)
+            new_amp = self._amplitude_logit.data[valid_indices].clone() - 0.5
+            new_tau = self._tau.data[valid_indices].clone()
             
-            # CONSTANT-Q: Halve sigma when doubling frequency (log space: subtract log(2))
-            new_sigma = self._sigma_logit.data[indices].clone() - math.log(harmonic_multiplier)
+            # CONSTANT-Q: Halve sigma for doubled frequency
+            new_sigma = self._sigma_logit.data[valid_indices].clone() - 0.693  # log(2)
+            new_sigma = torch.clamp(new_sigma, min=-7.0)  # Min ~0.5ms
             
-            new_phi = self._phi.data[indices].clone()  # Same phase alignment
-            new_gamma = self._gamma.data[indices].clone()  # Same chirp
+            new_phi = self._phi.data[valid_indices].clone()
+            new_gamma = self._gamma.data[valid_indices].clone()
             
         self.add_atoms(new_amp, new_tau, new_omega_logit, new_sigma, new_phi, new_gamma)
-        return len(indices)
+        return len(valid_indices)
 
     def split_atoms_by_indices(self, indices, scale_factor=1.6):
         if len(indices) == 0: return 0

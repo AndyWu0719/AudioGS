@@ -364,6 +364,9 @@ class MelSpectrogramLoss(nn.Module):
                 if right > center:
                     filterbank[i, j] = (right - j) / (right - center)
         
+        # Fix Bug #2: Add minimum to prevent all-zero rows (avoids log(0) edge cases)
+        filterbank = filterbank + 1e-10
+        
         return torch.FloatTensor(filterbank)
     
     def mel_spectrogram(self, x: torch.Tensor) -> torch.Tensor:
@@ -526,6 +529,9 @@ class CombinedAudioLoss(nn.Module):
         phase_reg_weight: float = 0.1,  # Strong enough to keep vectors healthy
     ) -> Tuple[torch.Tensor, dict]:
         
+        # Clamp prediction to avoid NaN in log-losses
+        pred = torch.clamp(pred, min=-10.0, max=10.0)
+
         # 1. Standard Losses (Dominantly Low/Mid Freq)
         stft_total, stft_dict = self.stft_loss(pred, target)
         mel_loss = self.mel_loss(pred, target)

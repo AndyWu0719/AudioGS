@@ -35,7 +35,9 @@ from src.models.atom import AudioGSModel
 from src.losses.spectral_loss import CombinedAudioLoss
 from src.utils.density_control import AdaptiveDensityController, rebuild_optimizer_from_model
 from src.utils.visualization import Visualizer
-from src.tools.metrics import compute_mss_loss
+from src.utils.density_control import AdaptiveDensityController, rebuild_optimizer_from_model
+from src.utils.visualization import Visualizer
+from src.tools.metrics import compute_mss_loss, compute_pesq, compute_sisdr
 
 # Try to import CUDA renderer
 CUDA_EXT_AVAILABLE = False
@@ -176,7 +178,7 @@ def compute_metrics(
     try:
         mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate, n_fft=1024, hop_length=256, n_mels=80
-        )
+        ).to(gt.device)  # Fix Bug #1: Ensure transform on same device as tensors
         mel_gt = mel_transform(gt.unsqueeze(0))
         mel_pred = mel_transform(pred.unsqueeze(0))
         mel_l1 = torch.nn.functional.l1_loss(
@@ -185,11 +187,17 @@ def compute_metrics(
     except Exception:
         mel_l1 = float('nan')
     
+
+    pesq_score = compute_pesq(gt, pred, sample_rate)
+    sisdr = compute_sisdr(gt, pred)
+        
     return {
         'mss_loss': mss,
         'l1_loss': l1,
         'snr_db': snr,
         'mel_l1': mel_l1,
+        'pesq': pesq_score,
+        'sisdr': sisdr,
     }
 
 
@@ -217,9 +225,22 @@ def fit_single_audio(
     filename = Path(audio_path).stem
     print(f"\n[Fit] {filename} ({audio_duration:.2f}s, {num_samples} samples)")
     
+    # DYNAMIC DENSITY: Compute atom counts based on duration
+    # Theory: 3000-4000 atoms/sec for high fidelity (Matching Pursuits literature)
+    initial_atoms_per_sec = config["model"].get("initial_atoms_per_second", 1024)
+    max_atoms_per_sec = config["model"].get("max_atoms_per_second", 4096)
+    initial_num_atoms = int(audio_duration * initial_atoms_per_sec)
+    max_num_atoms = int(audio_duration * max_atoms_per_sec)
+    
+    # Clamp to reasonable bounds
+    initial_num_atoms = max(256, min(initial_num_atoms, 8192))
+    max_num_atoms = max(1024, min(max_num_atoms, 32768))
+    
+    print(f"[Fit] Density: {initial_num_atoms} init → {max_num_atoms} max ({max_atoms_per_sec}/sec)")
+    
     # Initialize model
     model = AudioGSModel(
-        num_atoms=config["model"]["initial_num_atoms"],
+        num_atoms=initial_num_atoms,
         sample_rate=sample_rate,
         audio_duration=audio_duration,
         device=device,
@@ -262,14 +283,15 @@ def fit_single_audio(
         optimizer, milestones=[4000, 7000, 9000], gamma=0.5
     )
     
-    # Density Controller
+    # Density Controller with DYNAMIC max_atoms
     dc = config["density_control"]
     density_controller = AdaptiveDensityController(
         grad_threshold=dc["grad_threshold"],
         sigma_split_threshold=dc["sigma_split_threshold"],
         prune_amplitude_threshold=dc["prune_amplitude_threshold"],
-        max_num_atoms=config["model"]["max_num_atoms"],
+        max_num_atoms=max_num_atoms,  # DYNAMIC: based on audio duration
     )
+    enable_split = dc.get("enable_split", False)
     
     # Training loop
     pbar = tqdm(range(max_iters), desc=f"Fitting {filename}", leave=False)
@@ -284,6 +306,14 @@ def fit_single_audio(
             # PyTorch fallback (slower)
             pred_waveform = render_pytorch(amplitude, tau, omega, sigma, phi, gamma, 
                                            num_samples, sample_rate, device)
+        
+        # Soft amplitude compression to prevent extreme values
+        # Original working config: tanh(0.5)*2.0 provides good gradient flow
+        pred_waveform = torch.tanh(pred_waveform * 0.5) * 2.0
+        
+        if torch.isnan(pred_waveform).any():
+            print(f"[Warning] NaNs detected in renderer output at iter {iteration}!")
+            pred_waveform = torch.nan_to_num(pred_waveform, 0.0)
         
         # Loss
         loss, loss_dict = loss_fn(
@@ -301,11 +331,16 @@ def fit_single_audio(
         optimizer.step()
         scheduler.step()
         
-        # Density control
+        # Density control with enable_split from config
         density_controller.update_thresholds(loss.item())
         if dc["densify_from_iter"] <= iteration < dc["densify_until_iter"]:
             if iteration % dc["densification_interval"] == 0 and iteration > 0:
-                stats = density_controller.densify_and_prune(model, optimizer)
+                stats = density_controller.densify_and_prune(
+                    model, optimizer,
+                    do_split=enable_split,
+                    do_clone=True,
+                    do_prune=True,
+                )
         
         # Logging
         if iteration % config["training"]["log_interval"] == 0:
@@ -423,11 +458,11 @@ def main():
     print(f"\n{'='*80}")
     print("BENCHMARK RESULTS")
     print(f"{'='*80}")
-    print(f"{'File':<30} {'Duration':<10} {'SNR (dB)':<12} {'Mel-L1':<12} {'Atoms':<10}")
-    print(f"{'-'*80}")
+    print(f"{'File':<30} {'Duration':<10} {'SNR (dB)':<12} {'Mel-L1':<12} {'PESQ':<10} {'SI-SDR':<12} {'Atoms':<10}")
+    print(f"{'-'*110}")
     
     for m in all_metrics:
-        print(f"{m['file']:<30} {m['duration_s']:<10.2f} {m['snr_db']:<12.2f} {m['mel_l1']:<12.4f} {m['final_atoms']:<10}")
+        print(f"{m['file']:<30} {m['duration_s']:<10.2f} {m['snr_db']:<12.2f} {m['mel_l1']:<12.4f} {m['pesq']:<10.2f} {m['sisdr']:<12.2f} {m['final_atoms']:<10}")
     
     print(f"{'='*80}")
     
@@ -443,6 +478,9 @@ def main():
             f.write(f"  Duration: {m['duration_s']:.2f}s\n")
             f.write(f"  SNR: {m['snr_db']:.2f} dB\n")
             f.write(f"  Mel-L1: {m['mel_l1']:.4f}\n")
+            f.write(f"  PESQ: {m['pesq']:.2f}\n")
+            f.write(f"  SI-SDR: {m['sisdr']:.2f} dB\n")
+            f.write(f"  MSS Loss: {m['mss_loss']:.4f}\n")
             f.write(f"  MSS Loss: {m['mss_loss']:.4f}\n")
             f.write(f"  L1 Loss: {m['l1_loss']:.6f}\n")
             f.write(f"  Final Atoms: {m['final_atoms']}\n")

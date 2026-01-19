@@ -29,7 +29,15 @@ try:
     import whisper
     WHISPER_AVAILABLE = True
 except ImportError:
+    WHISPER_AVAILABLE = True
+except ImportError:
     WHISPER_AVAILABLE = False
+
+try:
+    from pesq import pesq
+    PESQ_AVAILABLE = True
+except ImportError:
+    PESQ_AVAILABLE = False
 
 
 # ============================================================
@@ -311,6 +319,112 @@ def compute_duration_error(
         "error_seconds": error,
         "error_percent": error_percent,
     }
+
+
+# ============================================================
+# Aggregate Evaluation
+# ============================================================
+
+# ============================================================
+# Advanced Audio Metrics (PESQ, SI-SDR)
+# ============================================================
+
+def compute_pesq(
+    ref_wav: torch.Tensor,
+    deg_wav: torch.Tensor,
+    sample_rate: int = 16000,
+    mode: str = "wb",
+) -> float:
+    """
+    Compute PESQ score.
+    
+    Args:
+        ref_wav: Reference waveform [T]
+        deg_wav: Degraded waveform [T]
+        sample_rate: Sample rate (must be 16000 or 8000)
+        mode: 'wb' (wideband) or 'nb' (narrowband)
+        
+    Returns:
+        PESQ score [-0.5, 4.5]
+    """
+
+    if not PESQ_AVAILABLE:
+        return float('nan')
+    
+    # Resample if needed (PESQ requires 16k or 8k)
+    target_sr = 16000 if mode == 'wb' else 8000
+    if sample_rate != target_sr:
+        resampler = torchaudio.transforms.Resample(sample_rate, target_sr).to(ref_wav.device)
+        ref_wav = resampler(ref_wav.view(1, -1)).squeeze()
+        deg_wav = resampler(deg_wav.view(1, -1)).squeeze()
+        sample_rate = target_sr
+
+    # Determine max length to avoid errors
+    min_len = min(ref_wav.shape[-1], deg_wav.shape[-1])
+    ref_wav = ref_wav[..., :min_len]
+    deg_wav = deg_wav[..., :min_len]
+
+    # Normalize to prevent PESQ error
+    ref_wav = ref_wav / (torch.max(torch.abs(ref_wav)) + 1e-8)
+    deg_wav = deg_wav / (torch.max(torch.abs(deg_wav)) + 1e-8)
+
+    try:
+        score = pesq(
+            sample_rate, 
+            ref_wav.detach().cpu().numpy(), 
+            deg_wav.detach().cpu().numpy(), 
+            mode
+        )
+        return score
+    except Exception as e:
+        print(f"PESQ Error: {e}")
+        return float('nan')
+
+
+def compute_sisdr(
+    ref_wav: torch.Tensor,
+    est_wav: torch.Tensor,
+) -> float:
+    """
+    Compute Scale-Invariant Signal-to-Distortion Ratio (SI-SDR).
+    
+    Args:
+        ref_wav: Reference waveform [T]
+        est_wav: Estimated waveform [T]
+        
+    Returns:
+        SI-SDR score in dB
+    """
+
+    eps = 1e-8
+    
+    # Ensure 1D
+    if ref_wav.dim() > 1: ref_wav = ref_wav.squeeze()
+    if est_wav.dim() > 1: est_wav = est_wav.squeeze()
+        
+    # Match length
+    min_len = min(len(ref_wav), len(est_wav))
+    ref = ref_wav[:min_len]
+    est = est_wav[:min_len]
+    
+    # Zero mean
+    ref = ref - torch.mean(ref)
+    est = est - torch.mean(est)
+    
+    # Optimal scaling
+    # alpha = <ref, est> / <ref, ref>
+    ref_energy = torch.sum(ref ** 2) + eps
+    alpha = torch.sum(ref * est) / ref_energy
+    
+    target = alpha * ref
+    noise = est - target
+    
+    # SI-SDR
+    target_pow = torch.sum(target ** 2) + eps
+    noise_pow = torch.sum(noise ** 2) + eps
+    
+    sisdr = 10 * torch.log10(target_pow / noise_pow)
+    return sisdr.item()
 
 
 # ============================================================

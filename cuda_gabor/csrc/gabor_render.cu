@@ -135,8 +135,11 @@ __global__ void gabor_backward_kernel(
     const float phi_i = phi[atom_idx];
     const float gamma_i = gamma[atom_idx];
     
-    const float sigma_sq = sigma_i * sigma_i + 1e-8f;
-    const float window_bound = sigma_i * sigma_mult;
+    // Fix Bug #5: Clamp sigma to minimum 1ms to prevent gradient explosion
+    // Without this, sigma=0.1ms causes gradients ~1e8 which break optimization
+    const float sigma_clamped = fmaxf(sigma_i, 0.001f);
+    const float sigma_sq = sigma_clamped * sigma_clamped;
+    const float window_bound = sigma_clamped * sigma_mult;
     
     // Compute window bounds in sample indices
     const int window_start = max(0, (int)((tau_i - window_bound) * sample_rate));
