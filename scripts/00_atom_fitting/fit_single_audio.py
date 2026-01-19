@@ -1,11 +1,15 @@
 """
 AudioGS Atom Fitting Script (Physics Pillars Compliant)
 
+Major Refactor:
+- Removed HF Sparsity hack (no longer needed with proper phase + density control)
+- Integrated phase_vector for unit-circle regularization
+
 Implements:
 - Pillar 1: atomicAdd (Linear Superposition)
 - Pillar 3: Constant-Q Sigma Initialization (σ ∝ 1/ω)
 - Pillar 4: STFT Loss > 90%
-- Pillar 5: Harmonic Cloning
+- Pillar 5: Harmonic Cloning (now density-controlled, no HF cloning)
 
 Usage:
     conda activate qwen2_CALM
@@ -35,8 +39,6 @@ from src.models.atom import AudioGSModel
 from src.losses.spectral_loss import CombinedAudioLoss
 from src.utils.density_control import AdaptiveDensityController, rebuild_optimizer_from_model
 from src.utils.visualization import Visualizer
-from src.utils.density_control import AdaptiveDensityController, rebuild_optimizer_from_model
-from src.utils.visualization import Visualizer
 from src.tools.metrics import compute_mss_loss, compute_pesq, compute_sisdr
 
 # Try to import CUDA renderer
@@ -58,16 +60,8 @@ except ImportError:
 
 # ============================================================
 # BENCHMARK TEST FILES (Pre-selected via torchaudio.info)
-# These are closest to 1s, 3s, 5s durations in LibriTTS_R/train-clean-100
 # ============================================================
-TEST_FILES = [
-    # Short (~1s) - Will be found by scan
-    None,
-    # Medium (~3s) - Will be found by scan
-    None,
-    # Long (~5s) - Will be found by scan
-    None,
-]
+TEST_FILES = [None, None, None]
 
 
 def find_test_files_by_duration(
@@ -77,14 +71,6 @@ def find_test_files_by_duration(
 ) -> List[str]:
     """
     Find audio files closest to target durations using torchaudio.info.
-    
-    Args:
-        root_path: Root directory to scan
-        target_durations: List of target durations in seconds
-        sample_rate: Expected sample rate
-        
-    Returns:
-        List of file paths, one per target duration
     """
     print(f"[Benchmark] Scanning {root_path} for test files...")
     
@@ -96,9 +82,8 @@ def find_test_files_by_duration(
     
     print(f"[Benchmark] Found {len(all_files)} WAV files, filtering by duration...")
     
-    # Collect file durations
     file_durations = []
-    for i, fpath in enumerate(all_files[:500]):  # Limit to first 500 for speed
+    for i, fpath in enumerate(all_files[:500]):
         try:
             info = torchaudio.info(str(fpath))
             duration = info.num_frames / info.sample_rate
@@ -109,7 +94,6 @@ def find_test_files_by_duration(
         if (i + 1) % 100 == 0:
             print(f"  Scanned {i+1} files...")
     
-    # Find closest files to each target duration
     result = []
     for target in target_durations:
         best_file = None
@@ -178,7 +162,7 @@ def compute_metrics(
     try:
         mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate, n_fft=1024, hop_length=256, n_mels=80
-        ).to(gt.device)  # Fix Bug #1: Ensure transform on same device as tensors
+        ).to(gt.device)
         mel_gt = mel_transform(gt.unsqueeze(0))
         mel_pred = mel_transform(pred.unsqueeze(0))
         mel_l1 = torch.nn.functional.l1_loss(
@@ -210,6 +194,10 @@ def fit_single_audio(
     """
     Fit Gabor atoms to a single audio file.
     
+    REFACTOR: 
+    - Removed HF Sparsity hack (density control now handles this)
+    - Integrated phase_vector for unit-circle regularization
+    
     Returns:
         Dict of metrics
     """
@@ -226,7 +214,6 @@ def fit_single_audio(
     print(f"\n[Fit] {filename} ({audio_duration:.2f}s, {num_samples} samples)")
     
     # DYNAMIC DENSITY: Compute atom counts based on duration
-    # Theory: 3000-4000 atoms/sec for high fidelity (Matching Pursuits literature)
     initial_atoms_per_sec = config["model"].get("initial_atoms_per_second", 1024)
     max_atoms_per_sec = config["model"].get("max_atoms_per_second", 4096)
     initial_num_atoms = int(audio_duration * initial_atoms_per_sec)
@@ -289,7 +276,7 @@ def fit_single_audio(
         grad_threshold=dc["grad_threshold"],
         sigma_split_threshold=dc["sigma_split_threshold"],
         prune_amplitude_threshold=dc["prune_amplitude_threshold"],
-        max_num_atoms=max_num_atoms,  # DYNAMIC: based on audio duration
+        max_num_atoms=max_num_atoms,
     )
     enable_split = dc.get("enable_split", False)
     
@@ -307,29 +294,25 @@ def fit_single_audio(
             pred_waveform = render_pytorch(amplitude, tau, omega, sigma, phi, gamma, 
                                            num_samples, sample_rate, device)
         
-        # NOTE: No non-linear compression - training and inference must be consistent
-        # gemini fixed: removed tanh(pred * 0.5) * 2.0 to match final render
-        
         if torch.isnan(pred_waveform).any():
             print(f"[Warning] NaNs detected in renderer output at iter {iteration}!")
             pred_waveform = torch.nan_to_num(pred_waveform, 0.0)
         
-        # Loss
+        # REFACTOR: Get phase_vector for unit-circle regularization
+        phase_vector = model.phase_vector  # Returns (cos, sin) tuple
+        
+        # Loss with phase regularization
         loss, loss_dict = loss_fn(
             pred_waveform, gt_waveform,
             model_amplitude=amplitude,
             model_sigma=sigma,
+            model_phase_raw=phase_vector,  # NEW: Enable phase regularization
             sigma_diversity_weight=dc.get("sigma_diversity_weight", 0.001),
         )
         
-        # gemini fixed: High-frequency sparsity regularization (bright band fix)
-        # Penalize high-freq atoms that are too loud (they cause constant noise)
-        # Increased weight 0.01 -> 0.1, lowered threshold 0.7 -> 0.6
-        nyquist = sample_rate / 2.0
-        high_freq_mask = (omega > 0.6 * nyquist).float()
-        hf_sparsity_loss = 0.1 * (high_freq_mask * amplitude).mean()
-        loss = loss + hf_sparsity_loss
-        loss_dict['hf_sparse'] = hf_sparsity_loss.item()
+        # REFACTOR: Removed HF Sparsity hack - density control now blocks HF cloning
+        # The phase vectorization + optimizer fix eliminates the artifacts that
+        # the HF sparsity hack was trying to address.
         
         # Backward
         optimizer.zero_grad()
@@ -339,7 +322,7 @@ def fit_single_audio(
         optimizer.step()
         scheduler.step()
         
-        # Density control with enable_split from config
+        # Density control
         density_controller.update_thresholds(loss.item())
         if dc["densify_from_iter"] <= iteration < dc["densify_until_iter"]:
             if iteration % dc["densification_interval"] == 0 and iteration > 0:
@@ -350,14 +333,14 @@ def fit_single_audio(
                     do_prune=True,
                 )
         
-        # Logging - gemini fixed: show all loss components for debugging
+        # Logging
         if iteration % config["training"]["log_interval"] == 0:
             pbar.set_postfix({
                 "L": f"{loss_dict['total']:.3f}",
                 "stft": f"{loss_dict['stft']:.2f}",
                 "mel": f"{loss_dict['mel']:.2f}",
                 "ph": f"{loss_dict['phase']:.2f}",
-                "pE": f"{loss_dict['pre_emp']:.3f}",
+                "pR": f"{loss_dict['phase_reg']:.3f}",  # NEW: phase reg
                 "n": model.num_atoms
             })
     
@@ -451,7 +434,7 @@ def main():
         raise ValueError("No test files found. Check dataset path.")
     
     print(f"\n{'='*60}")
-    print("AudioGS Atom Fitting Benchmark (Physics Pillars Compliant)")
+    print("AudioGS Atom Fitting Benchmark (Major Refactor)")
     print(f"{'='*60}")
     print(f"Files: {len(test_files)}")
     print(f"{'='*60}\n")
@@ -484,7 +467,7 @@ def main():
     # Save metrics to file
     metrics_path = output_dir / "metrics.txt"
     with open(metrics_path, 'w') as f:
-        f.write("AudioGS Atom Fitting Benchmark Results\n")
+        f.write("AudioGS Atom Fitting Benchmark Results (Major Refactor)\n")
         f.write(f"Date: {datetime.now().isoformat()}\n")
         f.write("="*60 + "\n\n")
         
@@ -495,7 +478,6 @@ def main():
             f.write(f"  Mel-L1: {m['mel_l1']:.4f}\n")
             f.write(f"  PESQ: {m['pesq']:.2f}\n")
             f.write(f"  SI-SDR: {m['sisdr']:.2f} dB\n")
-            f.write(f"  MSS Loss: {m['mss_loss']:.4f}\n")
             f.write(f"  MSS Loss: {m['mss_loss']:.4f}\n")
             f.write(f"  L1 Loss: {m['l1_loss']:.6f}\n")
             f.write(f"  Final Atoms: {m['final_atoms']}\n")
