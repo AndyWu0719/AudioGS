@@ -351,14 +351,30 @@ def fit_single_audio(
         
         # Logging
         if iteration % config["training"]["log_interval"] == 0:
+            # Count HF atoms for debugging
+            omega_np = omega.detach().cpu().numpy()
+            hf_count = (omega_np > 0.85 * model.nyquist_freq).sum()
             pbar.set_postfix({
                 "L": f"{loss_dict['total']:.3f}",
                 "mel": f"{loss_dict['mel']:.2f}",
                 "ph": f"{loss_dict['phase']:.2f}",
-                "cq": f"{loss_dict['cq_reg']:.4f}",  # NEW
+                "cq": f"{loss_dict['cq_reg']:.4f}",
                 "pR": f"{loss_dict['phase_reg']:.3f}",
-                "n": model.num_atoms
+                "n": model.num_atoms,
+                "HF": hf_count
             })
+        
+        # Checkpoint visualization (every 1000 iterations for debugging)
+        if iteration % 1000 == 0 and iteration > 0:
+            checkpoint_dir = output_dir / "checkpoints"
+            checkpoint_dir.mkdir(exist_ok=True)
+            with torch.no_grad():
+                if renderer is not None:
+                    ckpt_pred = renderer(amplitude, tau, omega, sigma, phi, gamma, num_samples)
+                else:
+                    ckpt_pred = render_pytorch(amplitude, tau, omega, sigma, phi, gamma, num_samples, sample_rate, device)
+            ckpt_visualizer = Visualizer(str(checkpoint_dir), sample_rate)
+            ckpt_visualizer.plot_spectrogram_comparison(gt_waveform, ckpt_pred, f"{filename}_iter{iteration:05d}")
     
     # Final render
     with torch.no_grad():

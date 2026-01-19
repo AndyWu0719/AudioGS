@@ -95,12 +95,9 @@ class DensityController:
         """
         Determine which atoms should be pruned (kept=True).
         
-        SIMPLE AMPLITUDE-BASED PRUNING:
-        ==============================
+        AMPLITUDE-BASED PRUNING with HF penalty:
         - Keep atoms with amplitude >= threshold
-        - Gentle penalty for very high frequencies (>90% Nyquist): 1.5x threshold
-        
-        NO energy-aware pruning - it was destroying consonant transients.
+        - Atoms > 85% Nyquist: 3x stricter threshold (to remove HF band artifacts)
         """
         amplitude = model.amplitude
         omega = model.omega
@@ -108,12 +105,12 @@ class DensityController:
         
         base_threshold = self.prune_amplitude_threshold
         
-        # Only penalize VERY high frequencies (>90% Nyquist)
-        # These are likely to be noise, not speech content
-        very_high_freq_mask = omega > 0.9 * nyquist
+        # Aggressive HF pruning: > 85% Nyquist gets 3x threshold
+        # This removes the HF band artifact from sigmoid saturation
+        very_high_freq_mask = omega > 0.85 * nyquist
         threshold = torch.where(
             very_high_freq_mask,
-            base_threshold * 1.5,  # Gentle 1.5x penalty (was 2x)
+            base_threshold * 3.0,  # Strong 3x penalty
             base_threshold
         )
         

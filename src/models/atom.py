@@ -85,6 +85,10 @@ class AudioGSModel(nn.Module):
         - 40% atoms: Initialize ω at harmonics up to 90% Nyquist (UNCAPPED)
         - 20% atoms: Random frequency (for unvoiced sounds)
         
+        SHORT AUDIO HANDLING (<2s):
+        - F0 detection is unreliable for short audio
+        - Use uniform tau + STFT-based frequency instead
+        
         Args:
             waveform: Audio waveform tensor
             use_f0_init: If True, use F0-guided initialization
@@ -104,19 +108,30 @@ class AudioGSModel(nn.Module):
             waveform_np = waveform.cpu().numpy()
             num_atoms = self.num_atoms
             
-            if use_f0_init:
+            # SHORT AUDIO HANDLING: <2s audio has unreliable F0 detection
+            # Use uniform tau + STFT instead of F0-guided
+            if self.audio_duration < 2.0:
+                print(f"[AudioGSModel] Short audio ({self.audio_duration:.2f}s < 2s): using uniform tau + STFT init")
+                # Uniform time distribution gives better coverage for short audio
+                taus = torch.linspace(0.01, self.audio_duration - 0.01, num_atoms, device=self.device)
+                # Add small jitter to avoid perfect grid artifacts
+                taus = taus + (torch.rand(num_atoms, device=self.device) - 0.5) * 0.02
+                taus = taus.clamp(0, self.audio_duration)
+                omegas, phis = self._stft_init(waveform, taus, n_fft, hop_length)
+            elif use_f0_init:
                 # F0-guided init returns voiced-weighted taus
                 taus, omegas, phis = self._f0_guided_init(waveform_np, num_atoms, hop_length)
             else:
-                # Uniform taus for STFT-based init
+                # Fallback: Random taus + STFT-based frequencies
                 taus = torch.rand(num_atoms, device=self.device) * self.audio_duration
-                omegas, phis = self._stft_peak_init(waveform, taus, n_fft, hop_length)
+                omegas, phis = self._stft_init(waveform, taus, n_fft, hop_length)
             
             # Assign to parameters
             self._tau.data = taus
             
-            # Convert omega (Hz) to logit
-            omega_normalized = (omegas / self.nyquist_freq).clamp(1e-5, 1 - 1e-5)
+            # Convert omega (Hz) to logit (using 85% Nyquist scaling to match property)
+            max_omega = 0.85 * self.nyquist_freq
+            omega_normalized = (omegas / max_omega).clamp(1e-5, 1 - 1e-5)
             self._omega_logit.data = torch.log(omega_normalized / (1 - omega_normalized))
             
             # REFACTOR: Convert scalar phase to vectorized phase
@@ -181,21 +196,36 @@ class AudioGSModel(nn.Module):
             return taus, omegas, phis
         
         # =====================================================
-        # VOICED-WEIGHTED TAU SAMPLING
-        # Dense in voiced regions, sparse in silence
+        # HYBRID TAU SAMPLING: 50% Uniform + 50% F0-Weighted
         # =====================================================
+        # Uniform ensures coverage of unvoiced regions (consonants)
+        # F0-weighted ensures dense coverage of voiced regions (vowels)
+        print(f"[F0 Init] Hybrid τ: 50% uniform + 50% voiced-weighted")
+        
+        num_uniform = num_atoms // 2
+        num_f0_weighted = num_atoms - num_uniform
+        
+        # Part 1: Uniform distribution (with small jitter)
+        uniform_taus = torch.linspace(0.01, self.audio_duration - 0.01, num_uniform, device=self.device)
+        uniform_taus = uniform_taus + (torch.rand(num_uniform, device=self.device) - 0.5) * 0.02
+        
+        # Part 2: F0-weighted distribution
         voiced_weights = np.where(np.isnan(voiced_prob), 0.05, voiced_prob)
         voiced_weights = voiced_weights / (voiced_weights.sum() + 1e-8)
         
-        # Sample frame indices weighted by voicing probability
         frame_indices = np.random.choice(
-            len(f0_times), size=num_atoms, replace=True, p=voiced_weights
+            len(f0_times), size=num_f0_weighted, replace=True, p=voiced_weights
         )
-        # Add small jitter within each frame's hop window
-        jitter = np.random.uniform(-0.5, 0.5, size=num_atoms) * (hop_length / self.sample_rate)
-        taus_np = f0_times[frame_indices] + jitter
-        taus_np = np.clip(taus_np, 0, self.audio_duration - 1e-6)
-        taus = torch.from_numpy(taus_np).float().to(self.device)
+        jitter = np.random.uniform(-0.5, 0.5, size=num_f0_weighted) * (hop_length / self.sample_rate)
+        f0_taus_np = f0_times[frame_indices] + jitter
+        f0_taus_np = np.clip(f0_taus_np, 0, self.audio_duration - 1e-6)
+        f0_taus = torch.from_numpy(f0_taus_np).float().to(self.device)
+        
+        # Combine and shuffle
+        taus = torch.cat([uniform_taus, f0_taus])
+        shuffle_idx = torch.randperm(num_atoms, device=self.device)
+        taus = taus[shuffle_idx]
+        taus_np = taus.cpu().numpy()
         
         # Create interpolators for F0 and voiced mask
         f0_interp = interp1d(
@@ -231,12 +261,12 @@ class AudioGSModel(nn.Module):
                 # Unvoiced region: mid-range frequency (fricatives)
                 omegas[idx] = np.random.uniform(2000, 6000)
         
-        # Harmonic atoms (40%): UNCAPPED harmonics up to 90% Nyquist
+        # Harmonic atoms (40%): harmonics up to 80% Nyquist (to prevent HF band)
         for i, idx in enumerate(harmonic_indices):
             if is_voiced[idx] and f0_at_taus[idx] > 50:
                 f0_hz = f0_at_taus[idx]
-                # REFACTOR: Dynamic harmonics up to 90% Nyquist (UNCAPPED)
-                max_harmonic = int(0.9 * self.nyquist_freq / f0_hz)
+                # Limit to 80% Nyquist to prevent HF band artifact
+                max_harmonic = int(0.80 * self.nyquist_freq / f0_hz)
                 if max_harmonic >= 2:
                     # Weighted selection: prefer lower harmonics (more energy in speech)
                     h_weights = np.array([1.0/h for h in range(2, max_harmonic + 1)])
@@ -249,9 +279,9 @@ class AudioGSModel(nn.Module):
                 # Unvoiced: mid-range
                 omegas[idx] = np.random.uniform(2000, 6000)
         
-        # Random atoms (20%): full spectrum coverage
+        # Random atoms (20%): spectrum coverage up to 80% Nyquist
         for idx in random_indices:
-            omegas[idx] = np.random.uniform(100, 0.9 * self.nyquist_freq)
+            omegas[idx] = np.random.uniform(100, 0.80 * self.nyquist_freq)
         
         # =====================================================
         # Phase Initialization from STFT (Bilinear Interpolation)
@@ -355,7 +385,7 @@ class AudioGSModel(nn.Module):
     
     def _stft_init(self, waveform: torch.Tensor, taus: torch.Tensor, n_fft: int, hop_length: int):
         """
-        STFT-based initialization with DE-CLUMPING via temperature scaling.
+        STFT-based initialization with frequency limit to 80% Nyquist.
         """
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
@@ -370,7 +400,9 @@ class AudioGSModel(nn.Module):
         
         num_freq_bins, num_frames = mag.shape
         freqs = torch.linspace(0, self.nyquist_freq, num_freq_bins, device=self.device)
-        frame_times = torch.arange(num_frames, device=self.device) * hop_length / self.sample_rate
+        
+        # Limit to 80% Nyquist to prevent HF band artifact
+        max_bin = int(num_freq_bins * 0.80)
         
         num_atoms = len(taus)
         omegas = torch.zeros(num_atoms, device=self.device)
@@ -380,13 +412,14 @@ class AudioGSModel(nn.Module):
             frame_idx = int(t / self.audio_duration * (num_frames - 1))
             frame_idx = max(0, min(frame_idx, num_frames - 1))
             
-            frame_mag = mag[:, frame_idx]
+            # Only consider first 80% of frequency bins
+            frame_mag = mag[:max_bin, frame_idx]
             if frame_mag.sum() > 0:
                 probs = torch.sqrt(frame_mag + 1e-10)
                 probs = probs / probs.sum()
                 freq_idx = torch.multinomial(probs, 1).item()
             else:
-                freq_idx = torch.randint(0, num_freq_bins, (1,)).item()
+                freq_idx = torch.randint(0, max_bin, (1,)).item()
             
             omegas[i] = freqs[freq_idx]
             phis[i] = phase[freq_idx, frame_idx]
@@ -407,8 +440,9 @@ class AudioGSModel(nn.Module):
         return self._tau
 
     @property
-    def omega(self) -> torch.Tensor: 
-        return torch.sigmoid(self._omega_logit) * self.nyquist_freq
+    def omega(self) -> torch.Tensor:
+        # Limit to 85% Nyquist to prevent HF band artifact from sigmoid saturation
+        return torch.sigmoid(self._omega_logit) * 0.85 * self.nyquist_freq
 
     @property
     def sigma(self) -> torch.Tensor: 
