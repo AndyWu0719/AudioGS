@@ -4,12 +4,15 @@ AudioGS Atom Fitting Script (Physics Pillars Compliant)
 Major Refactor:
 - Removed HF Sparsity hack (no longer needed with proper phase + density control)
 - Integrated phase_vector for unit-circle regularization
+- Added Constant-Q Regularization to prevent non-physical atoms
+- Increased mel_weight for better spectral envelope
 
 Implements:
 - Pillar 1: atomicAdd (Linear Superposition)
 - Pillar 3: Constant-Q Sigma Initialization (σ ∝ 1/ω)
 - Pillar 4: STFT Loss > 90%
 - Pillar 5: Harmonic Cloning (now density-controlled, no HF cloning)
+- Pillar 6: Constant-Q Regularization (NEW)
 
 Usage:
     conda activate qwen2_CALM
@@ -26,6 +29,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
 import torch
+import torch.nn.functional as F
 import torchaudio
 import numpy as np
 from tqdm import tqdm
@@ -197,6 +201,7 @@ def fit_single_audio(
     REFACTOR: 
     - Removed HF Sparsity hack (density control now handles this)
     - Integrated phase_vector for unit-circle regularization
+    - Added Constant-Q Regularization to prevent non-physical atoms
     
     Returns:
         Dict of metrics
@@ -247,7 +252,8 @@ def fit_single_audio(
     else:
         renderer = None
     
-    # Loss
+    # Loss Configuration
+    # REFACTOR: Increased mel_weight from 1.0 to 5.0 for better spectral envelope
     loss_config = config["loss"]
     loss_fn = CombinedAudioLoss(
         sample_rate=sample_rate,
@@ -255,7 +261,7 @@ def fit_single_audio(
         hop_sizes=loss_config["hop_sizes"],
         win_lengths=loss_config["win_lengths"],
         stft_weight=loss_config.get("spectral_weight", 1.0),
-        mel_weight=loss_config.get("mel_weight", 45.0),
+        mel_weight=loss_config.get("mel_weight", 5.0),  # INCREASED from 1.0 to 5.0
         time_weight=loss_config.get("time_domain_weight", 0.1),
         phase_weight=loss_config.get("phase_weight", 1.0),
         amp_reg_weight=loss_config.get("amp_reg_weight", 0.0001),
@@ -270,15 +276,20 @@ def fit_single_audio(
         optimizer, milestones=[4000, 7000, 9000], gamma=0.5
     )
     
-    # Density Controller with DYNAMIC max_atoms
+    # Density Controller with DYNAMIC max_atoms and frequency-adaptive splitting
     dc = config["density_control"]
     density_controller = AdaptiveDensityController(
         grad_threshold=dc["grad_threshold"],
         sigma_split_threshold=dc["sigma_split_threshold"],
         prune_amplitude_threshold=dc["prune_amplitude_threshold"],
         max_num_atoms=max_num_atoms,
+        max_cycles_for_split=dc.get("max_cycles_for_split", 40.0),  # NEW
     )
-    enable_split = dc.get("enable_split", False)
+    enable_split = dc.get("enable_split", True)  # Enable split by default now
+    
+    # Constant-Q Regularization parameters
+    cq_cycle_limit = dc.get("cq_cycle_limit", 50.0)  # Soft limit on cycles
+    cq_reg_weight = dc.get("cq_reg_weight", 0.01)    # Penalty weight
     
     # Training loop
     pbar = tqdm(range(max_iters), desc=f"Fitting {filename}", leave=False)
@@ -298,21 +309,32 @@ def fit_single_audio(
             print(f"[Warning] NaNs detected in renderer output at iter {iteration}!")
             pred_waveform = torch.nan_to_num(pred_waveform, 0.0)
         
-        # REFACTOR: Get phase_vector for unit-circle regularization
-        phase_vector = model.phase_vector  # Returns (cos, sin) tuple
+        # Get phase_vector for unit-circle regularization
+        phase_vector = model.phase_vector  # Returns RAW (cos, sin) tuple
         
-        # Loss with phase regularization
+        # Main loss with phase regularization
         loss, loss_dict = loss_fn(
             pred_waveform, gt_waveform,
             model_amplitude=amplitude,
             model_sigma=sigma,
-            model_phase_raw=phase_vector,  # NEW: Enable phase regularization
+            model_phase_raw=phase_vector,
             sigma_diversity_weight=dc.get("sigma_diversity_weight", 0.001),
         )
         
-        # REFACTOR: Removed HF Sparsity hack - density control now blocks HF cloning
-        # The phase vectorization + optimizer fix eliminates the artifacts that
-        # the HF sparsity hack was trying to address.
+        # =====================================================
+        # CONSTANT-Q REGULARIZATION LOSS (NEW)
+        # =====================================================
+        # Penalizes atoms that exceed the cycle limit (non-physical)
+        # An atom with sigma=10ms at omega=10kHz has 100 cycles = horizontal line
+        # This soft penalty prevents the optimizer from "cheating" on L1 loss
+        # by creating long atoms that don't represent transients properly.
+        #
+        # Formula: cq_reg = weight * mean(relu(sigma * omega - cycle_limit))
+        
+        current_cycles = sigma * omega  # cycles per atom
+        cq_reg_loss = cq_reg_weight * F.relu(current_cycles - cq_cycle_limit).mean()
+        loss = loss + cq_reg_loss
+        loss_dict['cq_reg'] = cq_reg_loss.item()
         
         # Backward
         optimizer.zero_grad()
@@ -322,7 +344,7 @@ def fit_single_audio(
         optimizer.step()
         scheduler.step()
         
-        # Density control
+        # Density control with frequency-adaptive splitting
         density_controller.update_thresholds(loss.item())
         if dc["densify_from_iter"] <= iteration < dc["densify_until_iter"]:
             if iteration % dc["densification_interval"] == 0 and iteration > 0:
@@ -337,10 +359,10 @@ def fit_single_audio(
         if iteration % config["training"]["log_interval"] == 0:
             pbar.set_postfix({
                 "L": f"{loss_dict['total']:.3f}",
-                "stft": f"{loss_dict['stft']:.2f}",
                 "mel": f"{loss_dict['mel']:.2f}",
                 "ph": f"{loss_dict['phase']:.2f}",
-                "pR": f"{loss_dict['phase_reg']:.3f}",  # NEW: phase reg
+                "cq": f"{loss_dict['cq_reg']:.4f}",  # NEW
+                "pR": f"{loss_dict['phase_reg']:.3f}",
                 "n": model.num_atoms
             })
     
@@ -434,7 +456,7 @@ def main():
         raise ValueError("No test files found. Check dataset path.")
     
     print(f"\n{'='*60}")
-    print("AudioGS Atom Fitting Benchmark (Major Refactor)")
+    print("AudioGS Atom Fitting Benchmark (Frequency-Adaptive Splitting)")
     print(f"{'='*60}")
     print(f"Files: {len(test_files)}")
     print(f"{'='*60}\n")
@@ -467,7 +489,7 @@ def main():
     # Save metrics to file
     metrics_path = output_dir / "metrics.txt"
     with open(metrics_path, 'w') as f:
-        f.write("AudioGS Atom Fitting Benchmark Results (Major Refactor)\n")
+        f.write("AudioGS Atom Fitting Benchmark Results (Frequency-Adaptive Splitting)\n")
         f.write(f"Date: {datetime.now().isoformat()}\n")
         f.write("="*60 + "\n\n")
         

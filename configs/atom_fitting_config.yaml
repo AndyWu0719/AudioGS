@@ -42,7 +42,7 @@ loss:
   hop_sizes: [512, 256, 128, 32]
   win_lengths: [2048, 1024, 512, 128]
   spectral_weight: 1.0       # Spectral Convergence + Log-Mag
-  mel_weight: 1.0            # LOW: Forces phase alignment
+  mel_weight: 10.0            # LOW: Forces phase alignment
   time_domain_weight: 0.1    # Waveform L1 for phase
   phase_weight: 1.0          # Complex STFT for phase (RESTORED)
   amp_reg_weight: 0.0001     # Light amplitude regularization (RESTORED)

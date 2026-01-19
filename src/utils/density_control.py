@@ -1,6 +1,7 @@
 """
 Density Control for Audio Gaussian Splatting.
-Major Refactor: Fixed Optimizer Index Mapping, High-Freq Clone Prevention.
+Major Refactor: Fixed Optimizer Index Mapping, High-Freq Clone Prevention,
+Frequency-Adaptive Splitting (Cycle-Based Threshold).
 """
 
 import torch
@@ -13,22 +14,26 @@ class DensityController:
     """
     Manages density control operations for AudioGS model.
     
-    REFACTOR: Critical fix for optimizer state mapping during pruning.
+    REFACTOR: 
+    - Critical fix for optimizer state mapping during pruning
+    - Frequency-adaptive split thresholds (cycle-based, not fixed time)
     """
     
     def __init__(
         self,
         grad_threshold: float = 0.0002,
-        sigma_split_threshold: float = 0.01,
+        sigma_split_threshold: float = 0.01,  # Upper bound for adaptive threshold
         prune_amplitude_threshold: float = 0.001,
         clone_scale: float = 1.5,
         max_num_atoms: int = 20000,
+        max_cycles_for_split: float = 40.0,  # NEW: Cycle-based split threshold
     ):
         self.grad_threshold = grad_threshold
         self.sigma_split_threshold = sigma_split_threshold
         self.prune_amplitude_threshold = prune_amplitude_threshold
         self.clone_scale = clone_scale
         self.max_num_atoms = max_num_atoms
+        self.max_cycles_for_split = max_cycles_for_split
         
     def get_densification_mask(
         self,
@@ -37,7 +42,16 @@ class DensityController:
         """
         Determine which atoms should be split vs cloned.
         
-        REFACTOR: High-freq atoms (>40% Nyquist) are blocked from cloning.
+        REFACTOR: 
+        - High-freq atoms (>40% Nyquist) are blocked from cloning
+        - FREQUENCY-ADAPTIVE SPLIT THRESHOLD (cycle-based, not fixed time)
+        
+        Physics Rationale:
+        ------------------
+        A fixed 10ms threshold means a 10kHz atom can have 100 cycles,
+        appearing as a horizontal striation (continuous tone) instead of
+        a transient. By using max_cycles / omega, we force HF atoms to
+        split earlier (e.g., 4ms at 10kHz = 40 cycles).
         """
         # Get average accumulated gradients
         avg_grads = model.get_average_gradients()
@@ -47,16 +61,36 @@ class DensityController:
         
         # Get sigma and omega values
         sigma = model.sigma
-        omega = model.omega
+        omega = model.omega  # Hz
         
-        # Split: high gradient AND large sigma
-        split_mask = high_grad_mask & (sigma > self.sigma_split_threshold)
+        # =====================================================
+        # FREQUENCY-ADAPTIVE SPLIT THRESHOLD (Cycle-Based)
+        # =====================================================
+        # An atom should not exceed max_cycles cycles
+        # adaptive_threshold = max_cycles / omega (in seconds)
+        # 
+        # Example at 10kHz (omega=10000):
+        #   adaptive_threshold = 40 / 10000 = 0.004s = 4ms
+        # Example at 100Hz (omega=100):
+        #   adaptive_threshold = 40 / 100 = 0.4s -> clamped to 10ms
         
-        # REFACTOR: Clone: high gradient AND small sigma AND NOT high frequency
+        adaptive_threshold = self.max_cycles_for_split / (omega + 1e-8)
+        
+        # Clamp to reasonable bounds:
+        # - Lower: 2ms (don't create sub-hop-size atoms)
+        # - Upper: sigma_split_threshold (default 10ms for low freqs)
+        adaptive_threshold = adaptive_threshold.clamp(
+            min=0.002,  # 2ms minimum
+            max=self.sigma_split_threshold
+        )
+        
+        # Split: high gradient AND sigma exceeds adaptive (cycle-based) threshold
+        split_mask = high_grad_mask & (sigma > adaptive_threshold)
+        
+        # Clone: high gradient AND small sigma AND NOT high frequency
         # High-freq atoms (>40% Nyquist) should Split or Prune, NOT Clone
-        # This prevents high-frequency noise artifacts from harmonic doubling
         high_freq_mask = omega > 0.4 * model.nyquist_freq
-        clone_mask = high_grad_mask & (sigma <= self.sigma_split_threshold) & (~high_freq_mask)
+        clone_mask = high_grad_mask & (sigma <= adaptive_threshold) & (~high_freq_mask)
         
         return split_mask, clone_mask
     
@@ -171,7 +205,7 @@ class DensityController:
             "tau": model._tau,
             "omega_logit": model._omega_logit,
             "sigma_logit": model._sigma_logit,
-            "phi_vector": model._phi_vector,  # REFACTORED: 2D
+            "phi_vector": model._phi_vector,  # 2D
             "gamma": model._gamma,
         }
     
@@ -188,17 +222,8 @@ class DensityController:
         CRITICAL FIX: When atoms [0, 2, 4] survive pruning, we must copy
         momentum states from indices [0, 2, 4], NOT [0, 1, 2]!
         
-        The old implementation did:
-            new_exp_avg[:n_copy] = old_exp_avg[:n_copy]
-        
-        This is WRONG because it copies consecutive indices, not the 
-        surviving indices. This caused "zombie atoms" with incorrect momentum.
-        
-        Args:
-            model: The AudioGS model (already modified)
-            optimizer: The Adam optimizer to update
-            old_params: Parameter dict from BEFORE modification
-            keep_indices: Tensor of indices that survived pruning (from remove_atoms)
+        Also handles: keep_indices may contain NEW atom indices (from clone/split)
+        that don't exist in old optimizer state - these get zero momentum.
         """
         new_params = self._get_param_dict(model)
         
@@ -310,6 +335,7 @@ class AdaptiveDensityController(DensityController):
         max_num_atoms: int = 20000,
         warmup_iters: int = 100,
         decay_factor: float = 0.99,
+        max_cycles_for_split: float = 40.0,  # NEW
     ):
         super().__init__(
             grad_threshold=grad_threshold,
@@ -317,6 +343,7 @@ class AdaptiveDensityController(DensityController):
             prune_amplitude_threshold=prune_amplitude_threshold,
             clone_scale=clone_scale,
             max_num_atoms=max_num_atoms,
+            max_cycles_for_split=max_cycles_for_split,
         )
         self.warmup_iters = warmup_iters
         self.decay_factor = decay_factor
