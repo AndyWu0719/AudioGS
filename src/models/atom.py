@@ -219,29 +219,34 @@ class AudioGSModel(nn.Module):
             if is_voiced[idx] and f0_at_taus[idx] > 50:
                 omegas[idx] = f0_at_taus[idx]
             else:
-                # Unvoiced region: random high frequency (fricatives)
-                omegas[idx] = np.random.uniform(2000, 8000)
+                # Unvoiced region: mid-range frequency (fricatives)
+                # gemini fixed: limit to 2000-6000 Hz to avoid bright band
+                omegas[idx] = np.random.uniform(2000, 6000)
         
         # Harmonic atoms (40%): DYNAMIC harmonics up to Nyquist
-        # Instead of fixed [2,3,4,5], compute max harmonic for each F0
+        # gemini fixed: limit max harmonic to 8 to prevent high-freq clustering
         for i, idx in enumerate(harmonic_indices):
             if is_voiced[idx] and f0_at_taus[idx] > 50:
                 f0_hz = f0_at_taus[idx]
-                # Compute max harmonic that fits under Nyquist
-                max_harmonic = int(self.nyquist_freq * 0.95 / f0_hz)
+                # Compute max harmonic that fits under 8kHz (not Nyquist)
+                # This prevents high harmonic clutter near Nyquist
+                max_harmonic = min(8, int(8000 / f0_hz))  # Cap at 8th harmonic
                 if max_harmonic >= 2:
-                    # Randomly select a harmonic from [2, max_harmonic]
-                    h = np.random.randint(2, max_harmonic + 1)
+                    # Weighted selection: prefer lower harmonics (more energy in speech)
+                    # Use 1/h weighting: h=2 has 2x probability of h=4
+                    h_weights = np.array([1.0/h for h in range(2, max_harmonic + 1)])
+                    h_weights = h_weights / h_weights.sum()
+                    h = np.random.choice(range(2, max_harmonic + 1), p=h_weights)
                     omegas[idx] = f0_hz * h
                 else:
                     omegas[idx] = f0_hz  # F0 too high, use fundamental
             else:
-                # Unvoiced: random
-                omegas[idx] = np.random.uniform(1000, 10000)
+                # Unvoiced: mid-range (gemini fixed: 2000-6000 to avoid bright band)
+                omegas[idx] = np.random.uniform(2000, 6000)
         
-        # Random atoms (20%): full spectrum
+        # Random atoms (20%): mid-spectrum (gemini fixed: cap at 8kHz to avoid bright band)
         for idx in random_indices:
-            omegas[idx] = np.random.uniform(100, self.nyquist_freq * 0.9)
+            omegas[idx] = np.random.uniform(100, 8000)
         
         # =====================================================
         # Phase Initialization from STFT (Bilinear Interpolation)
@@ -522,9 +527,9 @@ class AudioGSModel(nn.Module):
             # Get parent frequencies (in Hz)
             parent_omega_hz = self.omega[indices]  # Already in Hz via property
             
-            # BRIGHT BAND FIX: Filter out high-frequency atoms
-            # Only clone atoms below 50% Nyquist (doubling stays below Nyquist)
-            max_clone_freq = self.nyquist_freq * 0.45  # Conservative: 45%
+            # BRIGHT BAND FIX: Filter out very high-frequency atoms
+            # gemini fixed: relaxed from 0.45 to 0.80 to allow mid-high cloning
+            max_clone_freq = self.nyquist_freq * 0.80  # Relaxed: 80%
             valid_mask = parent_omega_hz < max_clone_freq
             
             if not valid_mask.any():
@@ -550,6 +555,11 @@ class AudioGSModel(nn.Module):
             new_amp = self._amplitude_logit.data[valid_indices].clone() - 0.5
             new_tau = self._tau.data[valid_indices].clone()
             
+            # gemini fixed: Add tau jitter to break positional clustering (bright band fix)
+            # High-freq atoms created at identical positions cause constant-energy band
+            tau_jitter = torch.randn_like(new_tau) * 0.005  # ±5ms random displacement
+            new_tau = (new_tau + tau_jitter).clamp(0, self.audio_duration - 1e-6)
+            
             # CONSTANT-Q: Halve sigma for doubled frequency
             new_sigma = self._sigma_logit.data[valid_indices].clone() - 0.693  # log(2)
             new_sigma = torch.clamp(new_sigma, min=-7.0)  # Min ~0.5ms
@@ -567,9 +577,13 @@ class AudioGSModel(nn.Module):
             tau = self._tau.data[indices]
             offset = sigma * 0.5
             
+            # gemini fixed: Add tau jitter to break positional clustering (bright band fix)
+            tau_jitter1 = torch.randn_like(tau) * 0.003  # ±3ms
+            tau_jitter2 = torch.randn_like(tau) * 0.003
+            
             # Atom 1
             new_amp1 = self._amplitude_logit.data[indices].clone() - 0.3
-            new_tau1 = tau - offset
+            new_tau1 = (tau - offset + tau_jitter1).clamp(0, self.audio_duration - 1e-6)
             # Add freq noise to explore
             new_omega1 = self._omega_logit.data[indices].clone() + torch.randn_like(self._omega_logit.data[indices]) * 0.05
             new_sigma1 = self._sigma_logit.data[indices].clone() - math.log(scale_factor)
@@ -578,7 +592,7 @@ class AudioGSModel(nn.Module):
             
             # Atom 2
             new_amp2 = self._amplitude_logit.data[indices].clone() - 0.3
-            new_tau2 = tau + offset
+            new_tau2 = (tau + offset + tau_jitter2).clamp(0, self.audio_duration - 1e-6)
             new_omega2 = self._omega_logit.data[indices].clone() - torch.randn_like(self._omega_logit.data[indices]) * 0.05
             new_sigma2 = new_sigma1.clone()
             new_phi2 = self._phi.data[indices].clone() + math.pi * 0.5

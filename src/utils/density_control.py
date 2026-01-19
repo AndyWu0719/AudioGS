@@ -51,9 +51,28 @@ class DensityController:
         return split_mask, clone_mask
     
     def get_prune_mask(self, model: nn.Module) -> torch.Tensor:
-        """Determine which atoms should be pruned (kept=True)."""
+        """
+        Determine which atoms should be pruned (kept=True).
+        
+        gemini fixed: Frequency-aware pruning - high-freq atoms have stricter threshold
+        to remove static atoms causing the "bright band" artifact.
+        """
         amplitude = model.amplitude
-        keep_mask = amplitude >= self.prune_amplitude_threshold
+        omega = model.omega
+        nyquist = model.nyquist_freq
+        
+        # Base threshold
+        base_threshold = self.prune_amplitude_threshold
+        
+        # High-freq atoms (>70% Nyquist) have 2× stricter threshold
+        high_freq_mask = omega > 0.7 * nyquist
+        adaptive_threshold = torch.where(
+            high_freq_mask,
+            base_threshold * 2.0,  # Stricter for high freq
+            base_threshold
+        )
+        
+        keep_mask = amplitude >= adaptive_threshold
         return keep_mask
     
     def densify_and_prune(

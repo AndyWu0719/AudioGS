@@ -307,9 +307,8 @@ def fit_single_audio(
             pred_waveform = render_pytorch(amplitude, tau, omega, sigma, phi, gamma, 
                                            num_samples, sample_rate, device)
         
-        # Soft amplitude compression to prevent extreme values
-        # Original working config: tanh(0.5)*2.0 provides good gradient flow
-        pred_waveform = torch.tanh(pred_waveform * 0.5) * 2.0
+        # NOTE: No non-linear compression - training and inference must be consistent
+        # gemini fixed: removed tanh(pred * 0.5) * 2.0 to match final render
         
         if torch.isnan(pred_waveform).any():
             print(f"[Warning] NaNs detected in renderer output at iter {iteration}!")
@@ -322,6 +321,15 @@ def fit_single_audio(
             model_sigma=sigma,
             sigma_diversity_weight=dc.get("sigma_diversity_weight", 0.001),
         )
+        
+        # gemini fixed: High-frequency sparsity regularization (bright band fix)
+        # Penalize high-freq atoms that are too loud (they cause constant noise)
+        # Increased weight 0.01 -> 0.1, lowered threshold 0.7 -> 0.6
+        nyquist = sample_rate / 2.0
+        high_freq_mask = (omega > 0.6 * nyquist).float()
+        hf_sparsity_loss = 0.1 * (high_freq_mask * amplitude).mean()
+        loss = loss + hf_sparsity_loss
+        loss_dict['hf_sparse'] = hf_sparsity_loss.item()
         
         # Backward
         optimizer.zero_grad()
@@ -342,9 +350,16 @@ def fit_single_audio(
                     do_prune=True,
                 )
         
-        # Logging
+        # Logging - gemini fixed: show all loss components for debugging
         if iteration % config["training"]["log_interval"] == 0:
-            pbar.set_postfix({"loss": f"{loss_dict['total']:.4f}", "atoms": model.num_atoms})
+            pbar.set_postfix({
+                "L": f"{loss_dict['total']:.3f}",
+                "stft": f"{loss_dict['stft']:.2f}",
+                "mel": f"{loss_dict['mel']:.2f}",
+                "ph": f"{loss_dict['phase']:.2f}",
+                "pE": f"{loss_dict['pre_emp']:.3f}",
+                "n": model.num_atoms
+            })
     
     # Final render
     with torch.no_grad():

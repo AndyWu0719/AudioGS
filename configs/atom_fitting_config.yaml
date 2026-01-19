@@ -23,9 +23,9 @@ initialization:
 # Training (PHASE-FIRST STRATEGY)
 # Higher LRs compensate for smaller gradients from low mel weight
 training:
-  learning_rate: 0.001    # Increased from 0.0005
-  lr_amplitude: 0.01      # Increased from 0.005
-  lr_position: 0.0001     # Keep low for stable tau
+  learning_rate: 0.01    # Increased from 0.0005
+  lr_amplitude: 0.005     # gemini fixed: reduced to prevent premature silencing
+  lr_position: 0.001      # gemini fixed: increased 10× to allow movement
   lr_frequency: 0.003     # Increased from 0.0013
   lr_sigma: 0.01          # Increased from 0.014
   lr_phase: 0.015         # Increased from 0.0115
@@ -52,12 +52,12 @@ loss:
 density_control:
   grad_threshold: 0.0002
   sigma_split_threshold: 0.01  # 10ms threshold
-  prune_amplitude_threshold: 0.001   # RESTORED: original prune threshold
+  prune_amplitude_threshold: 0.0005  # gemini fixed: lowered to prevent premature pruning
   densify_from_iter: 500
   densify_until_iter: 10000          # RESTORED: original densify end
   densification_interval: 100
   sigma_diversity_weight: 0.001
-  enable_split: false                # DISABLED: split causes artifacts
+  enable_split: true                 # gemini fixed: enables high-freq regeneration
 
 # Output
 output:
