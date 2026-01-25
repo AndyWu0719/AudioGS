@@ -98,15 +98,19 @@ class Visualizer:
     def compute_mel_spectrogram(
         self,
         waveform: Union[torch.Tensor, np.ndarray],
+        return_db: bool = True,
+        ref_power: Optional[float] = None,
     ) -> np.ndarray:
         """
         Compute log mel-spectrogram.
         
         Args:
             waveform: Audio tensor or array
+            return_db: If True, return dB-scaled mel; otherwise return power mel
+            ref_power: Reference power for dB conversion (shared ref across plots)
             
         Returns:
-            Log mel-spectrogram [n_mels, T']
+            Mel-spectrogram [n_mels, T'] (dB if return_db else power)
         """
         import librosa
         
@@ -125,10 +129,11 @@ class Visualizer:
             n_mels=self.n_mels,
         )
         
-        # Convert to log scale
-        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        if return_db:
+            ref = ref_power if ref_power is not None else np.max
+            mel_spec = librosa.power_to_db(mel_spec, ref=ref)
         
-        return mel_spec_db
+        return mel_spec
     
     def plot_spectrogram_comparison(
         self,
@@ -149,9 +154,14 @@ class Visualizer:
         Returns:
             Path to saved figure
         """
+        import librosa
+
         # Compute spectrograms
-        gt_mel = self.compute_mel_spectrogram(gt_waveform)
-        pred_mel = self.compute_mel_spectrogram(pred_waveform)
+        gt_mel_power = self.compute_mel_spectrogram(gt_waveform, return_db=False)
+        pred_mel_power = self.compute_mel_spectrogram(pred_waveform, return_db=False)
+        ref_power = np.max(gt_mel_power)
+        gt_mel = librosa.power_to_db(gt_mel_power, ref=ref_power)
+        pred_mel = librosa.power_to_db(pred_mel_power, ref=ref_power)
         
         # Create figure
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))

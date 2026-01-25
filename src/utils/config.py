@@ -21,6 +21,7 @@ DEFAULT_INIT_CONFIG = {
     "constant_q_cycles": 3.5,
     "sigma_min": 0.002,  # 2ms
     "sigma_max": 0.050,  # 50ms
+    "omega_min_hz": 50.0,
     "constant_q_use_2pi": True,
 }
 
@@ -35,6 +36,7 @@ class InitConfig:
     constant_q_cycles: float = 3.5
     sigma_min: float = 0.002
     sigma_max: float = 0.050
+    omega_min_hz: float = 50.0
     constant_q_use_2pi: bool = True
     
     @classmethod
@@ -46,6 +48,7 @@ class InitConfig:
             constant_q_cycles=config_dict.get("constant_q_cycles", DEFAULT_INIT_CONFIG["constant_q_cycles"]),
             sigma_min=config_dict.get("sigma_min", DEFAULT_INIT_CONFIG["sigma_min"]),
             sigma_max=config_dict.get("sigma_max", DEFAULT_INIT_CONFIG["sigma_max"]),
+            omega_min_hz=config_dict.get("omega_min_hz", DEFAULT_INIT_CONFIG["omega_min_hz"]),
             constant_q_use_2pi=config_dict.get(
                 "constant_q_use_2pi", DEFAULT_INIT_CONFIG["constant_q_use_2pi"]
             ),
@@ -57,6 +60,7 @@ class InitConfig:
             "constant_q_cycles": self.constant_q_cycles,
             "sigma_min": self.sigma_min,
             "sigma_max": self.sigma_max,
+            "omega_min_hz": self.omega_min_hz,
             "constant_q_use_2pi": self.constant_q_use_2pi,
         }
 

@@ -262,7 +262,6 @@ def fit_single_audio(
         renderer = None
     
     # Loss Configuration
-    # REFACTOR: Increased mel_weight from 1.0 to 5.0 for better spectral envelope
     loss_config = config["loss"]
     loss_fn = CombinedAudioLoss(
         sample_rate=sample_rate,
@@ -270,7 +269,7 @@ def fit_single_audio(
         hop_sizes=loss_config["hop_sizes"],
         win_lengths=loss_config["win_lengths"],
         stft_weight=loss_config.get("spectral_weight", 1.0),
-        mel_weight=loss_config.get("mel_weight", 5.0),  # INCREASED from 1.0 to 5.0
+        mel_weight=loss_config.get("mel_weight", 5.0),
         time_weight=loss_config.get("time_domain_weight", 0.1),
         phase_weight=loss_config.get("phase_weight", 1.0),
         amp_reg_weight=loss_config.get("amp_reg_weight", 0.0001),
@@ -466,18 +465,6 @@ def fit_single_audio(
                 "HF": hf_count
             })
         
-        # Checkpoint visualization (every 1000 iterations for debugging)
-        if iteration % 1000 == 0 and iteration > 0:
-            checkpoint_dir = output_dir / "checkpoints"
-            checkpoint_dir.mkdir(exist_ok=True)
-            with torch.no_grad():
-                if renderer is not None:
-                    ckpt_pred = renderer(amplitude, tau, omega, sigma, phi, gamma, num_samples)
-                else:
-                    ckpt_pred = render_pytorch(amplitude, tau, omega, sigma, phi, gamma, num_samples, sample_rate, device)
-            ckpt_visualizer = Visualizer(str(checkpoint_dir), sample_rate)
-            ckpt_visualizer.plot_spectrogram_comparison(gt_waveform, ckpt_pred, f"{filename}_iter{iteration:05d}")
-    
     # Final render
     with torch.no_grad():
         amplitude, tau, omega, sigma, phi, gamma = model.get_all_params()

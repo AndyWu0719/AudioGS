@@ -351,7 +351,7 @@ class MelSpectrogramLoss(nn.Module):
         return torch.FloatTensor(filterbank)
     
     def mel_spectrogram(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute mel-spectrogram from raw audio."""
+        """Compute power mel-spectrogram from raw audio."""
         squeeze_output = False
         if x.dim() == 1:
             x = x.unsqueeze(0)
@@ -371,8 +371,8 @@ class MelSpectrogramLoss(nn.Module):
             pad_mode="reflect",
         )
         
-        mag = stft_out.abs()
-        mel = torch.matmul(mel_basis, mag)
+        power = stft_out.abs().pow(2)
+        mel = torch.matmul(mel_basis, power)
         
         if squeeze_output:
             mel = mel.squeeze(0)
@@ -382,7 +382,8 @@ class MelSpectrogramLoss(nn.Module):
     def mel_from_mag(self, mag: torch.Tensor) -> torch.Tensor:
         """Compute mel-spectrogram from pre-computed magnitude."""
         mel_basis = self.mel_basis.to(mag.device)
-        return torch.matmul(mel_basis, mag)
+        power = mag.pow(2)
+        return torch.matmul(mel_basis, power)
     
     def forward(
         self,

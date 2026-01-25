@@ -88,6 +88,8 @@ class AudioGSModel(nn.Module):
         self.nyquist_freq = sample_rate / 2.0
         self.audio_duration = audio_duration
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self._set_init_config(InitConfig.from_dict(None))
         
         # Initialize placeholders
         self._init_empty_parameters(num_atoms)
@@ -110,6 +112,12 @@ class AudioGSModel(nn.Module):
         self.register_buffer("tau_grad_accum", torch.zeros(num_atoms, device=self.device))
         self.register_buffer("grad_accum_count", torch.zeros(1, device=self.device))
 
+    def _set_init_config(self, init_cfg: InitConfig):
+        self._init_cfg = init_cfg
+        self.sigma_min = init_cfg.sigma_min
+        self.sigma_max = init_cfg.sigma_max
+        self.omega_min_hz = init_cfg.omega_min_hz
+
     def init_random(self, init_config: Optional[dict] = None):
         """
         Fallback: Random initialization with CONSTANT-Q SIGMA.
@@ -124,8 +132,7 @@ class AudioGSModel(nn.Module):
         """
         # Get config values or defaults
         init_cfg = InitConfig.from_dict(init_config)
-        SIGMA_MIN = init_cfg.sigma_min
-        SIGMA_MAX = init_cfg.sigma_max
+        self._set_init_config(init_cfg)
         
         with torch.no_grad():
             self._amplitude_logit.data.normal_(0, 0.1)
@@ -136,9 +143,9 @@ class AudioGSModel(nn.Module):
             # CONSTANT-Q SIGMA: σ = cycles / (2π f) if enabled, else cycles / f
             # This ensures atoms can properly represent their frequency
             omega_hz = torch.sigmoid(self._omega_logit.data) * 0.99 * self.nyquist_freq
-            omega_hz = omega_hz.clamp(min=50.0)  # Min 50Hz for numerical stability
+            omega_hz = omega_hz.clamp(min=self.omega_min_hz)
             constant_q_sigma = _constant_q_sigma(omega_hz, init_cfg)
-            constant_q_sigma = constant_q_sigma.clamp(min=SIGMA_MIN, max=SIGMA_MAX)
+            constant_q_sigma = constant_q_sigma.clamp(min=self.sigma_min, max=self.sigma_max)
             
             # Issue 2 Fix: Use correct inverse transform (not torch.log)
             self._sigma_logit.data = _sigma_real_to_logit(constant_q_sigma)
@@ -179,8 +186,7 @@ class AudioGSModel(nn.Module):
         
         # Read config or use defaults (Issue D: wire config fields)
         init_cfg = InitConfig.from_dict(init_config)
-        SIGMA_MIN = init_cfg.sigma_min
-        SIGMA_MAX = init_cfg.sigma_max
+        self._set_init_config(init_cfg)
         
         # Random init first to ensure no atoms are stuck at default zeros (0.5 Nyquist)
         self.init_random(init_config)
@@ -228,8 +234,8 @@ class AudioGSModel(nn.Module):
             
             # CONSTANT-Q SIGMA: σ inversely proportional to frequency
             # Uses config values (Issue D: wired from YAML)
-            constant_q_sigma = _constant_q_sigma(omegas.clamp(min=50.0), init_cfg)
-            constant_q_sigma = constant_q_sigma.clamp(min=SIGMA_MIN, max=SIGMA_MAX)
+            constant_q_sigma = _constant_q_sigma(omegas.clamp(min=self.omega_min_hz), init_cfg)
+            constant_q_sigma = constant_q_sigma.clamp(min=self.sigma_min, max=self.sigma_max)
             # Use correct inverse transform (Issue B)
             self._sigma_logit.data = _sigma_real_to_logit(constant_q_sigma)
             
@@ -242,7 +248,7 @@ class AudioGSModel(nn.Module):
         """
         F0-guided frequency initialization using librosa.pyin.
         
-        REFACTOR: Harmonics now extend to 90% Nyquist (UNCAPPED).
+        REFACTOR: Harmonics now extend to 99% Nyquist.
         
         Returns:
             taus: Time positions for each atom (voiced-weighted)
@@ -341,15 +347,15 @@ class AudioGSModel(nn.Module):
         
         # F0 atoms (40%)
         for idx in f0_indices:
-            if is_voiced[idx] and f0_at_taus[idx] > 50:
+            if is_voiced[idx] and f0_at_taus[idx] > self.omega_min_hz:
                 omegas[idx] = f0_at_taus[idx]
             else:
                 # Unvoiced region: mid-range frequency (fricatives)
                 omegas[idx] = np.random.uniform(2000, 6000)
         
-        # Harmonic atoms (40%): harmonics up to 80% Nyquist (to prevent HF band)
+        # Harmonic atoms (40%): harmonics up to 99% Nyquist
         for i, idx in enumerate(harmonic_indices):
-            if is_voiced[idx] and f0_at_taus[idx] > 50:
+            if is_voiced[idx] and f0_at_taus[idx] > self.omega_min_hz:
                 f0_hz = f0_at_taus[idx]
                 # Limit to 99% Nyquist
                 max_harmonic = int(0.99 * self.nyquist_freq / f0_hz)
@@ -367,7 +373,7 @@ class AudioGSModel(nn.Module):
         
         # Random atoms (20%): spectrum coverage up to 99% Nyquist
         for idx in random_indices:
-            omegas[idx] = np.random.uniform(100, 0.99 * self.nyquist_freq)
+            omegas[idx] = np.random.uniform(max(100.0, self.omega_min_hz), 0.99 * self.nyquist_freq)
         
         # =====================================================
         # Phase Initialization from STFT (Bilinear Interpolation)
@@ -424,7 +430,7 @@ class AudioGSModel(nn.Module):
         omegas_tensor = torch.from_numpy(omegas).float().to(self.device)
         phis_tensor = torch.from_numpy(phis).float().to(self.device)
         
-        print(f"[F0 Init] Voiced-weighted τ sampling, dynamic harmonics up to 90% Nyquist")
+        print(f"[F0 Init] Voiced-weighted τ sampling, dynamic harmonics up to 99% Nyquist")
         print(f"[F0 Init] Voiced atoms: {np.sum(is_voiced)}/{num_atoms}, Phase: STFT bilinear interpolation")
         
         return taus, omegas_tensor, phis_tensor
@@ -567,7 +573,7 @@ class AudioGSModel(nn.Module):
                     self.sample_rate / n_fft
                 ) * freq_jitter_bins
             tau_cand = tau_cand.clamp(0.0, self.audio_duration - 1e-6)
-            omega_cand = omega_cand.clamp(min=50.0, max=0.99 * self.nyquist_freq)
+            omega_cand = omega_cand.clamp(min=init_cfg.omega_min_hz, max=0.99 * self.nyquist_freq)
             sigma_cand = _constant_q_sigma(omega_cand, init_cfg).clamp(
                 min=init_cfg.sigma_min,
                 max=init_cfg.sigma_max,
@@ -743,7 +749,7 @@ class AudioGSModel(nn.Module):
                 if freq_jitter_bins > 0.0:
                     freq_jitter = (torch.rand_like(omega) - 0.5) * freq_jitter_bins * (self.sample_rate / n_fft)
                     omega = omega + freq_jitter
-                omega = omega.clamp(min=50.0, max=0.99 * self.nyquist_freq)
+                omega = omega.clamp(min=init_cfg.omega_min_hz, max=0.99 * self.nyquist_freq)
                 phi = phase[freq_idx, time_idx]
 
                 frame_energy_vals = frame_energy[time_idx]
@@ -768,7 +774,8 @@ class AudioGSModel(nn.Module):
     
     def _stft_init(self, waveform: torch.Tensor, taus: torch.Tensor, n_fft: int, hop_length: int):
         """
-        STFT-based initialization with frequency limit to 80% Nyquist.
+        STFT-based initialization with frequency limit to 99% Nyquist.
+        Respects omega_min_hz to avoid subsonic/DC bias.
         """
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
@@ -786,6 +793,8 @@ class AudioGSModel(nn.Module):
         
         # Limit to 99% Nyquist
         max_bin = int(num_freq_bins * 0.99)
+        min_bin = int((self.omega_min_hz / self.nyquist_freq) * (num_freq_bins - 1))
+        min_bin = max(0, min(min_bin, max_bin - 1))
         
         num_atoms = len(taus)
         omegas = torch.zeros(num_atoms, device=self.device)
@@ -795,14 +804,14 @@ class AudioGSModel(nn.Module):
             frame_idx = int(t / self.audio_duration * (num_frames - 1))
             frame_idx = max(0, min(frame_idx, num_frames - 1))
             
-            # Only consider first 80% of frequency bins
-            frame_mag = mag[:max_bin, frame_idx]
+            # Only consider bins within [omega_min_hz, 99% Nyquist]
+            frame_mag = mag[min_bin:max_bin, frame_idx]
             if frame_mag.sum() > 0:
                 probs = torch.sqrt(frame_mag + 1e-10)
                 probs = probs / probs.sum()
-                freq_idx = torch.multinomial(probs, 1).item()
+                freq_idx = torch.multinomial(probs, 1).item() + min_bin
             else:
-                freq_idx = torch.randint(0, max_bin, (1,)).item()
+                freq_idx = torch.randint(min_bin, max_bin, (1,)).item()
             
             omegas[i] = freqs[freq_idx]
             phis[i] = phase[freq_idx, frame_idx]
@@ -908,6 +917,14 @@ class AudioGSModel(nn.Module):
         """Clamp parameters to valid ranges after optimizer steps."""
         with torch.no_grad():
             self._tau.data.clamp_(0.0, self.audio_duration - 1e-6)
+            sigma_min_logit = _sigma_real_to_logit(torch.tensor(self.sigma_min, device=self.device))
+            sigma_max_logit = _sigma_real_to_logit(torch.tensor(self.sigma_max, device=self.device))
+            self._sigma_logit.data.clamp_(min=sigma_min_logit.item(), max=sigma_max_logit.item())
+
+            omega_min = max(self.omega_min_hz, 1e-3)
+            omega_min_logit = _omega_real_to_logit(torch.tensor(omega_min, device=self.device), self.nyquist_freq)
+            omega_max_logit = _omega_real_to_logit(torch.tensor(0.99 * self.nyquist_freq, device=self.device), self.nyquist_freq)
+            self._omega_logit.data.clamp_(min=omega_min_logit.item(), max=omega_max_logit.item())
 
     def add_atoms(self, amplitude_logit, tau, omega_logit, sigma_logit, phi_vector, gamma):
         """Add new atoms with 2D phi_vector."""
