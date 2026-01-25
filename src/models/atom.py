@@ -1,11 +1,79 @@
 """
 AudioGS Model: Learnable Gabor Atoms for Audio Representation.
 Major Refactor: Vectorized Phase, Uncapped Harmonics, Weighted Gradient Tracking.
+
+Code Maintenance Update:
+- Fixed sigma offset to 1ms to match CUDA kernel clamp
+- Added correct inverse transforms for densification
+- Wired config fields to initialization
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from typing import Dict, List, Tuple, Optional
+
+from src.utils.config import InitConfig, SIGMA_OFFSET as CONFIG_SIGMA_OFFSET
+
+# =============================================================================
+# Constants for parameterization
+# =============================================================================
+
+SIGMA_OFFSET = CONFIG_SIGMA_OFFSET  # 1ms minimum sigma (matches CUDA kernel clamp)
+SPLIT_AMP_SCALE = 1.0 / math.sqrt(2.0)
+CLONE_AMP_SCALE = 0.5
+
+
+# =============================================================================
+# Inverse Transform Helpers for Densification
+# =============================================================================
+def _inv_softplus(y: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
+    """
+    Numerically stable inverse softplus: log(exp(y) - 1).
+    
+    For large y, inv_softplus(y) ≈ y (avoiding overflow).
+    For small y, uses the exact formula.
+    """
+    threshold = 20.0  # Above this, exp(y) overflows; use approximation
+    return torch.where(
+        y > threshold,
+        y,
+        torch.log(torch.expm1(y * beta).clamp(min=1e-8)) / beta
+    )
+
+
+def _sigma_real_to_logit(sigma_real: torch.Tensor) -> torch.Tensor:
+    """
+    Convert real sigma (seconds) to _sigma_logit.
+    
+    Inverse of: sigma_real = softplus(_sigma_logit) + SIGMA_OFFSET
+    """
+    return _inv_softplus((sigma_real - SIGMA_OFFSET).clamp(min=1e-8))
+
+
+def _omega_real_to_logit(omega_real: torch.Tensor, nyquist: float) -> torch.Tensor:
+    """
+    Convert real omega (Hz) to _omega_logit.
+    
+    Inverse of: omega_real = sigmoid(_omega_logit) * 0.99 * nyquist
+    Uses 0.99 * nyquist scaling to match the forward property.
+    """
+    max_omega = 0.99 * nyquist
+    normalized = (omega_real / max_omega).clamp(1e-5, 1 - 1e-5)
+    return torch.log(normalized / (1 - normalized))  # logit
+
+
+def _constant_q_sigma(omega_hz: torch.Tensor, init_cfg: InitConfig) -> torch.Tensor:
+    """
+    Constant-Q sigma from frequency.
+
+    If constant_q_use_2pi is enabled, treat constant_q_cycles as Q (f / BW).
+    Otherwise treat it as a raw cycles-per-sigma factor.
+    """
+    denom = omega_hz
+    if init_cfg.constant_q_use_2pi:
+        denom = 2.0 * math.pi * omega_hz
+    return init_cfg.constant_q_cycles / (denom + 1e-8)
 
 class AudioGSModel(nn.Module):
     def __init__(
@@ -42,27 +110,38 @@ class AudioGSModel(nn.Module):
         self.register_buffer("tau_grad_accum", torch.zeros(num_atoms, device=self.device))
         self.register_buffer("grad_accum_count", torch.zeros(1, device=self.device))
 
-    def init_random(self):
+    def init_random(self, init_config: Optional[dict] = None):
         """
         Fallback: Random initialization with CONSTANT-Q SIGMA.
         
         AUDIO PHYSICS: Sigma must scale with frequency. A 100Hz wave has
         period 10ms, so sigma must be ≥10ms to represent it without gaps.
+        
+        Issue 2 Fix: Uses correct inv_softplus transform and wires config values.
+        
+        Args:
+            init_config: Optional dict with 'constant_q_cycles', 'sigma_min', 'sigma_max'
         """
+        # Get config values or defaults
+        init_cfg = InitConfig.from_dict(init_config)
+        SIGMA_MIN = init_cfg.sigma_min
+        SIGMA_MAX = init_cfg.sigma_max
+        
         with torch.no_grad():
             self._amplitude_logit.data.normal_(0, 0.1)
             self._tau.data.uniform_(0, self.audio_duration)
             # Init omega uniformly across full range to avoid "dead bands"
             self._omega_logit.data.uniform_(-5.0, 5.0)
             
-            # CONSTANT-Q SIGMA: σ = num_cycles / ω (Hz)
+            # CONSTANT-Q SIGMA: σ = cycles / (2π f) if enabled, else cycles / f
             # This ensures atoms can properly represent their frequency
-            N_CYCLES = 3.5  # ~3.5 cycles per atom
-            omega_hz = torch.sigmoid(self._omega_logit.data) * self.nyquist_freq
+            omega_hz = torch.sigmoid(self._omega_logit.data) * 0.99 * self.nyquist_freq
             omega_hz = omega_hz.clamp(min=50.0)  # Min 50Hz for numerical stability
-            constant_q_sigma = N_CYCLES / omega_hz  # seconds
-            constant_q_sigma = constant_q_sigma.clamp(min=0.002, max=0.050)  # 2ms-50ms
-            self._sigma_logit.data = torch.log(constant_q_sigma)
+            constant_q_sigma = _constant_q_sigma(omega_hz, init_cfg)
+            constant_q_sigma = constant_q_sigma.clamp(min=SIGMA_MIN, max=SIGMA_MAX)
+            
+            # Issue 2 Fix: Use correct inverse transform (not torch.log)
+            self._sigma_logit.data = _sigma_real_to_logit(constant_q_sigma)
             
             # REFACTOR: Random phase vectors (unit circle)
             random_angles = torch.rand(self.num_atoms, device=self.device) * 2 * math.pi
@@ -74,7 +153,8 @@ class AudioGSModel(nn.Module):
         waveform: torch.Tensor, 
         use_f0_init: bool = True, 
         n_fft: int = 2048, 
-        hop_length: int = 512
+        hop_length: int = 512,
+        init_config: Optional[dict] = None
     ):
         """
         Initialize atom parameters with F0-guided or STFT-based strategy.
@@ -97,8 +177,13 @@ class AudioGSModel(nn.Module):
         """
         print(f"[AudioGSModel] Initializing from audio (use_f0_init={use_f0_init})...")
         
+        # Read config or use defaults (Issue D: wire config fields)
+        init_cfg = InitConfig.from_dict(init_config)
+        SIGMA_MIN = init_cfg.sigma_min
+        SIGMA_MAX = init_cfg.sigma_max
+        
         # Random init first to ensure no atoms are stuck at default zeros (0.5 Nyquist)
-        self.init_random()
+        self.init_random(init_config)
         
         with torch.no_grad():
             waveform = waveform.to(self.device)
@@ -142,10 +227,11 @@ class AudioGSModel(nn.Module):
             self._amplitude_logit.data.fill_(-2.0)  # softplus(-2) ≈ 0.13
             
             # CONSTANT-Q SIGMA: σ inversely proportional to frequency
-            N_CYCLES = 3.5
-            constant_q_sigma = N_CYCLES / omegas.clamp(min=50.0)
-            constant_q_sigma = constant_q_sigma.clamp(min=0.002, max=0.050)
-            self._sigma_logit.data = torch.log(constant_q_sigma)
+            # Uses config values (Issue D: wired from YAML)
+            constant_q_sigma = _constant_q_sigma(omegas.clamp(min=50.0), init_cfg)
+            constant_q_sigma = constant_q_sigma.clamp(min=SIGMA_MIN, max=SIGMA_MAX)
+            # Use correct inverse transform (Issue B)
+            self._sigma_logit.data = _sigma_real_to_logit(constant_q_sigma)
             
             # Gamma (chirp): zero initially (no frequency modulation)
             self._gamma.data.zero_()
@@ -382,6 +468,303 @@ class AudioGSModel(nn.Module):
         
         print(f"[STFT Peak Init] Initialized {num_atoms} atoms from spectral peaks")
         return omegas, phis
+
+    def add_atoms_from_residual(
+        self,
+        residual: torch.Tensor,
+        num_atoms: int,
+        init_config: Optional[dict] = None,
+        n_fft: int = 2048,
+        hop_length: int = 512,
+        amp_scale: float = 0.3,
+        peaks_per_frame: int = 4,
+        min_peak_ratio: float = 0.25,
+        time_jitter_ratio: float = 0.5,
+        freq_jitter_bins: float = 0.5,
+        selection_strategy: str = "stft_peak",
+        sigma_multiplier: float = 5.0,
+        mp_amp_max: Optional[float] = None,
+        mp_normalize: bool = True,
+        mp_score_min: float = 0.0,
+    ) -> int:
+        """
+        Add new atoms from residual STFT peaks (residual-guided densification).
+        Optionally use MP-style selection via Gabor inner products.
+        """
+        if num_atoms <= 0:
+            return 0
+        init_cfg = InitConfig.from_dict(init_config)
+        with torch.no_grad():
+            if residual.dim() == 2:
+                residual = residual.squeeze(0)
+            residual = residual.to(self.device)
+
+            window = torch.hann_window(n_fft, device=self.device)
+            stft = torch.stft(
+                residual,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                return_complex=True,
+                window=window,
+                center=True,
+            )
+            mag = stft.abs()
+            phase = stft.angle()
+
+            num_freq_bins, num_frames = mag.shape
+            if num_freq_bins == 0 or num_frames == 0:
+                return 0
+
+            frame_energy = mag.mean(dim=0)
+            if frame_energy.max().item() <= 0:
+                return 0
+
+            peaks_per_frame = max(1, min(peaks_per_frame, num_freq_bins))
+            frames_to_sample = min(num_frames, max(1, int(math.ceil(num_atoms / peaks_per_frame))))
+
+            probs = frame_energy / (frame_energy.sum() + 1e-8)
+            replacement = frames_to_sample > num_frames
+            frame_indices = torch.multinomial(probs, frames_to_sample, replacement=replacement)
+
+            cand_freq = []
+            cand_time = []
+            cand_mag = []
+            cand_frame_max = []
+            for frame_idx in frame_indices.tolist():
+                frame_mag = mag[:, frame_idx]
+                if num_freq_bins > 1:
+                    frame_mag = frame_mag.clone()
+                    frame_mag[0] = 0.0
+                frame_max = frame_mag.max()
+                if frame_max.item() <= 0:
+                    continue
+                topk = torch.topk(frame_mag, k=peaks_per_frame, largest=True)
+                for f_idx, m_val in zip(topk.indices.tolist(), topk.values.tolist()):
+                    if m_val < frame_max.item() * min_peak_ratio:
+                        continue
+                    cand_freq.append(f_idx)
+                    cand_time.append(frame_idx)
+                    cand_mag.append(m_val)
+                    cand_frame_max.append(frame_max.item())
+
+            if len(cand_mag) == 0:
+                return 0
+
+            selection = selection_strategy.lower()
+            cand_freq_t = torch.tensor(cand_freq, device=self.device, dtype=torch.long)
+            cand_time_t = torch.tensor(cand_time, device=self.device, dtype=torch.long)
+            cand_mag_t = torch.tensor(cand_mag, device=self.device)
+            cand_frame_max_t = torch.tensor(cand_frame_max, device=self.device)
+
+            tau_cand = cand_time_t.float() * hop_length / self.sample_rate
+            omega_cand = cand_freq_t.float() * (self.sample_rate / n_fft)
+            if time_jitter_ratio > 0.0:
+                tau_cand = tau_cand + (torch.rand_like(tau_cand) - 0.5) * (
+                    hop_length / self.sample_rate
+                ) * time_jitter_ratio
+            if freq_jitter_bins > 0.0:
+                omega_cand = omega_cand + (torch.rand_like(omega_cand) - 0.5) * (
+                    self.sample_rate / n_fft
+                ) * freq_jitter_bins
+            tau_cand = tau_cand.clamp(0.0, self.audio_duration - 1e-6)
+            omega_cand = omega_cand.clamp(min=50.0, max=0.99 * self.nyquist_freq)
+            sigma_cand = _constant_q_sigma(omega_cand, init_cfg).clamp(
+                min=init_cfg.sigma_min,
+                max=init_cfg.sigma_max,
+            )
+
+            def _compute_inner(residual_local, tau_i, omega_i, sigma_i):
+                num_samples = residual_local.shape[-1]
+                window_bound = float((sigma_i * sigma_multiplier).item())
+                if window_bound <= 0:
+                    return None
+                tau_scalar = float(tau_i.item())
+                window_start = max(0, int((tau_scalar - window_bound) * self.sample_rate))
+                window_end = min(num_samples - 1, int((tau_scalar + window_bound) * self.sample_rate))
+                if window_start > window_end:
+                    return None
+
+                t = torch.arange(window_start, window_end + 1, device=self.device, dtype=residual_local.dtype)
+                t = t / self.sample_rate - tau_i
+                t_sq = t * t
+
+                envelope = torch.exp(-t_sq / (2.0 * sigma_i * sigma_i))
+                normalized_dist = torch.abs(t) / (window_bound + 1e-8)
+                window_factor = torch.ones_like(normalized_dist)
+                outer_mask = normalized_dist > 0.8
+                if outer_mask.any():
+                    edge_t = (normalized_dist[outer_mask] - 0.8) / 0.2
+                    window_factor[outer_mask] = 0.5 * (1.0 + torch.cos(math.pi * edge_t))
+
+                g = envelope * window_factor
+                phase_arg = 2.0 * math.pi * omega_i * t
+                cos_term = torch.cos(phase_arg)
+                sin_term = torch.sin(phase_arg)
+
+                r_seg = residual_local[window_start:window_end + 1]
+                u = g * cos_term
+                v = g * sin_term
+
+                a = torch.dot(r_seg, u)
+                b = torch.dot(r_seg, v)
+                uu = torch.dot(u, u)
+                vv = torch.dot(v, v)
+                denom = 0.5 * (uu + vv)
+                if denom <= 0:
+                    return None
+
+                ip_mag = torch.sqrt(a * a + b * b)
+                score = ip_mag / (torch.sqrt(denom) + 1e-8) if mp_normalize else ip_mag
+                A = ip_mag / (denom + 1e-8)
+                phi_i = torch.atan2(-b, a)
+                return score, A, phi_i, window_start, window_end, u, v
+
+            if selection in ("mp_iterative", "mp_explicit"):
+                residual_work = residual.clone()
+                used = torch.zeros(tau_cand.shape[0], device=self.device, dtype=torch.bool)
+                amp_list = []
+                phi_list = []
+                tau_list = []
+                omega_list = []
+                sigma_list = []
+
+                max_steps = min(num_atoms, tau_cand.shape[0])
+                for _ in range(max_steps):
+                    best_idx = None
+                    best_score = None
+                    best_A = None
+                    best_phi = None
+                    best_start = None
+                    best_end = None
+                    best_u = None
+                    best_v = None
+
+                    for i in range(tau_cand.shape[0]):
+                        if used[i]:
+                            continue
+                        result = _compute_inner(residual_work, tau_cand[i], omega_cand[i], sigma_cand[i])
+                        if result is None:
+                            continue
+                        score, A, phi_i, window_start, window_end, u, v = result
+                        if score < mp_score_min:
+                            continue
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_idx = i
+                            best_A = A
+                            best_phi = phi_i
+                            best_start = window_start
+                            best_end = window_end
+                            best_u = u
+                            best_v = v
+
+                    if best_idx is None:
+                        break
+
+                    if mp_amp_max is not None:
+                        best_A = best_A.clamp(max=mp_amp_max)
+
+                    amp_list.append(best_A)
+                    phi_list.append(best_phi)
+                    tau_list.append(tau_cand[best_idx])
+                    omega_list.append(omega_cand[best_idx])
+                    sigma_list.append(sigma_cand[best_idx])
+
+                    cos_phi = torch.cos(best_phi)
+                    sin_phi = torch.sin(best_phi)
+                    atom = best_A * (cos_phi * best_u - sin_phi * best_v)
+                    residual_work[best_start:best_end + 1] -= atom
+
+                    used[best_idx] = True
+
+                if len(amp_list) == 0:
+                    return 0
+
+                tau = torch.stack(tau_list)
+                omega = torch.stack(omega_list)
+                sigma = torch.stack(sigma_list)
+                phi = torch.stack(phi_list)
+                amp = torch.stack(amp_list) * amp_scale
+                if mp_amp_max is not None:
+                    amp = amp.clamp(max=mp_amp_max)
+            elif selection in ("mp", "matching_pursuit"):
+                scores = []
+                amps = []
+                phis = []
+                taus = []
+                omegas = []
+                sigmas = []
+
+                for i in range(cand_mag_t.numel()):
+                    result = _compute_inner(residual, tau_cand[i], omega_cand[i], sigma_cand[i])
+                    if result is None:
+                        continue
+                    score, A, phi_i, _, _, _, _ = result
+                    if score < mp_score_min:
+                        continue
+                    scores.append(score)
+                    amps.append(A)
+                    phis.append(phi_i)
+                    taus.append(tau_cand[i])
+                    omegas.append(omega_cand[i])
+                    sigmas.append(sigma_cand[i])
+
+                if len(scores) == 0:
+                    return 0
+
+                scores_t = torch.stack(scores)
+                k = min(num_atoms, scores_t.numel())
+                sel = torch.topk(scores_t, k=k, largest=True).indices
+
+                tau = torch.stack(taus)[sel]
+                omega = torch.stack(omegas)[sel]
+                sigma = torch.stack(sigmas)[sel]
+                phi = torch.stack(phis)[sel]
+                amp = torch.stack(amps)[sel] * amp_scale
+                if mp_amp_max is not None:
+                    amp = amp.clamp(max=mp_amp_max)
+            else:
+                k = min(num_atoms, cand_mag_t.numel())
+                topk = torch.topk(cand_mag_t, k=k, largest=True)
+                sel = topk.indices
+
+                freq_idx = cand_freq_t[sel]
+                time_idx = cand_time_t[sel]
+                mag_vals = cand_mag_t[sel]
+                frame_max_vals = cand_frame_max_t[sel]
+
+                tau = time_idx.float() * hop_length / self.sample_rate
+                if time_jitter_ratio > 0.0:
+                    time_jitter = (torch.rand_like(tau) - 0.5) * (hop_length / self.sample_rate) * time_jitter_ratio
+                    tau = tau + time_jitter
+                tau = tau.clamp(0.0, self.audio_duration - 1e-6)
+
+                omega = freq_idx.float() * (self.sample_rate / n_fft)
+                if freq_jitter_bins > 0.0:
+                    freq_jitter = (torch.rand_like(omega) - 0.5) * freq_jitter_bins * (self.sample_rate / n_fft)
+                    omega = omega + freq_jitter
+                omega = omega.clamp(min=50.0, max=0.99 * self.nyquist_freq)
+                phi = phase[freq_idx, time_idx]
+
+                frame_energy_vals = frame_energy[time_idx]
+                frame_energy_ratio = (frame_energy_vals / (frame_energy.max() + 1e-8)).sqrt()
+                amp = (mag_vals / (frame_max_vals + 1e-8)) * amp_scale * frame_energy_ratio
+
+                sigma = _constant_q_sigma(omega, init_cfg).clamp(
+                    min=init_cfg.sigma_min,
+                    max=init_cfg.sigma_max,
+                )
+
+            amp = amp.clamp(min=1e-6)
+            amp_logit = _inv_softplus(amp)
+            sigma_logit = _sigma_real_to_logit(sigma)
+            omega_logit = _omega_real_to_logit(omega, self.nyquist_freq)
+
+            phi_vector = torch.stack([torch.cos(phi), torch.sin(phi)], dim=-1)
+            gamma = torch.zeros_like(omega)
+
+        self.add_atoms(amp_logit, tau, omega_logit, sigma_logit, phi_vector, gamma)
+        return int(amp.shape[0])
     
     def _stft_init(self, waveform: torch.Tensor, taus: torch.Tensor, n_fft: int, hop_length: int):
         """
@@ -447,8 +830,8 @@ class AudioGSModel(nn.Module):
     @property
     def sigma(self) -> torch.Tensor: 
         # Use softplus for smooth positive sigma values
-        # Minimum 0.5ms (~12 samples at 24kHz) to prevent gradient explosion
-        return torch.nn.functional.softplus(self._sigma_logit) + 0.0005
+        # Minimum 1ms (0.001s) to match CUDA kernel clamp and prevent gradient explosion
+        return F.softplus(self._sigma_logit) + SIGMA_OFFSET
 
     @property
     def phi(self) -> torch.Tensor: 
@@ -521,6 +904,11 @@ class AudioGSModel(nn.Module):
         self.tau_grad_accum.zero_()
         self.grad_accum_count.zero_()
 
+    def clamp_parameters(self):
+        """Clamp parameters to valid ranges after optimizer steps."""
+        with torch.no_grad():
+            self._tau.data.clamp_(0.0, self.audio_duration - 1e-6)
+
     def add_atoms(self, amplitude_logit, tau, omega_logit, sigma_logit, phi_vector, gamma):
         """Add new atoms with 2D phi_vector."""
         with torch.no_grad():
@@ -549,63 +937,87 @@ class AudioGSModel(nn.Module):
             self.tau_grad_accum = self.tau_grad_accum[mask]
         return keep_indices
 
-    def clone_atoms_by_indices(self, indices):
+    def clone_atoms_by_indices(self, indices, clone_config: Optional[dict] = None):
         """
         Clone atoms using JITTERED HARMONIC STACKING for additive synthesis.
         
-        REFACTOR: 
-        - Discards clones that exceed 95% Nyquist (prevents HF pile-up)
-        - Uses real sigma / 2 -> logit conversion
+        Issue B Fix: Uses correct inverse transforms for sigma and omega logits.
+        - omega uses 0.99*nyquist scaling (matches forward property)
+        - sigma uses inv_softplus(sigma_real - SIGMA_OFFSET)
         """
         if len(indices) == 0: 
             return 0
-        
-        with torch.no_grad():
-            # Get parent frequencies (in Hz)
-            parent_omega_hz = self.omega[indices]
-            
-            # Compute target harmonic with JITTER
-            jitter = torch.empty_like(parent_omega_hz).uniform_(0.95, 1.05)
-            target_omega_hz = parent_omega_hz * 2.0 * jitter
-            
-            # FILTER: Discard atoms exceeding 95% Nyquist
-            # This prevents "bright band" artifact at the boundary
-            valid_mask = target_omega_hz < (0.95 * self.nyquist_freq)
-            
+
+        cfg = clone_config or {}
+        strategy = cfg.get("strategy", "harmonic")
+        harmonic_prob = cfg.get("harmonic_prob", 0.5)
+        local_jitter = cfg.get("local_jitter_ratio", 0.08)
+        harmonic_jitter = cfg.get("harmonic_jitter_ratio", 0.05)
+        max_freq_ratio = cfg.get("max_freq_ratio", 0.95)
+        tau_jitter_std = cfg.get("tau_jitter_std", 0.005)
+        sigma_scale_harmonic = cfg.get("sigma_scale_harmonic", 0.5)
+        sigma_scale_local = cfg.get("sigma_scale_local", 0.8)
+
+        indices = indices.to(self.device)
+        if strategy == "mixed":
+            selector = torch.rand(len(indices), device=self.device) < harmonic_prob
+            harmonic_indices = indices[selector]
+            local_indices = indices[~selector]
+        elif strategy == "local":
+            harmonic_indices = torch.tensor([], device=self.device, dtype=torch.long)
+            local_indices = indices
+        else:
+            harmonic_indices = indices
+            local_indices = torch.tensor([], device=self.device, dtype=torch.long)
+
+        def _clone_with_targets(valid_indices, target_omega_hz, sigma_scale):
+            if len(valid_indices) == 0:
+                return 0
+            # Filter by max frequency ratio
+            valid_mask = target_omega_hz < (max_freq_ratio * self.nyquist_freq)
             if not valid_mask.any():
                 return 0
-                
-            # Filter valid indices and values
             valid_target_omega = target_omega_hz[valid_mask]
-            valid_indices = indices[valid_mask]
-            
-            # Convert target omega to logit space
-            omega_normalized = (valid_target_omega / self.nyquist_freq).clamp(1e-5, 1 - 1e-5)
-            new_omega_logit = torch.log(omega_normalized / (1 - omega_normalized))
-            
-            # Clone other parameters (filtered)
-            new_amp = self._amplitude_logit.data[valid_indices].clone() - 0.5
-            new_tau = self._tau.data[valid_indices].clone()
-            
-            # Add tau jitter
-            tau_jitter = torch.randn_like(new_tau) * 0.005
+            valid_idx = valid_indices[valid_mask]
+
+            new_omega_logit = _omega_real_to_logit(valid_target_omega, self.nyquist_freq)
+            parent_amp = self.amplitude[valid_idx]
+            new_amp_real = (parent_amp * CLONE_AMP_SCALE).clamp(min=1e-6)
+            new_amp = _inv_softplus(new_amp_real)
+            new_tau = self._tau.data[valid_idx].clone()
+            tau_jitter = torch.randn_like(new_tau) * tau_jitter_std
             new_tau = (new_tau + tau_jitter).clamp(0, self.audio_duration - 1e-6)
-            
-            # Sigma logic
-            parent_sigma_real = self.sigma[valid_indices]
-            new_sigma_real = parent_sigma_real / 2.0
-            new_sigma_real = new_sigma_real.clamp(min=0.0005)
-            new_sigma = torch.log(new_sigma_real)
-            
-            # Clone vectors
-            new_phi_vector = self._phi_vector.data[valid_indices].clone()
-            new_gamma = self._gamma.data[valid_indices].clone()
-            
-        self.add_atoms(new_amp, new_tau, new_omega_logit, new_sigma, new_phi_vector, new_gamma)
-        return len(valid_indices)
+
+            parent_sigma_real = self.sigma[valid_idx]
+            new_sigma_real = (parent_sigma_real * sigma_scale).clamp(min=SIGMA_OFFSET + 1e-6)
+            new_sigma = _sigma_real_to_logit(new_sigma_real)
+
+            new_phi_vector = self._phi_vector.data[valid_idx].clone()
+            new_gamma = self._gamma.data[valid_idx].clone()
+
+            self.add_atoms(new_amp, new_tau, new_omega_logit, new_sigma, new_phi_vector, new_gamma)
+            return len(valid_idx)
+
+        num_added = 0
+        if len(harmonic_indices) > 0:
+            parent_omega_hz = self.omega[harmonic_indices]
+            jitter = torch.empty_like(parent_omega_hz).uniform_(1.0 - harmonic_jitter, 1.0 + harmonic_jitter)
+            target_omega_hz = parent_omega_hz * 2.0 * jitter
+            num_added += _clone_with_targets(harmonic_indices, target_omega_hz, sigma_scale_harmonic)
+        if len(local_indices) > 0:
+            parent_omega_hz = self.omega[local_indices]
+            jitter = torch.empty_like(parent_omega_hz).uniform_(-local_jitter, local_jitter)
+            target_omega_hz = parent_omega_hz * (1.0 + jitter)
+            num_added += _clone_with_targets(local_indices, target_omega_hz, sigma_scale_local)
+
+        return num_added
 
     def split_atoms_by_indices(self, indices, scale_factor=1.6):
-        """Split atoms into two with smaller sigma and displaced tau."""
+        """
+        Split atoms into two with smaller sigma and displaced tau.
+        
+        Issue B Fix: Uses correct inverse transform for sigma logit.
+        """
         if len(indices) == 0: 
             return 0
         with torch.no_grad():
@@ -616,16 +1028,21 @@ class AudioGSModel(nn.Module):
             tau_jitter1 = torch.randn_like(tau) * 0.003
             tau_jitter2 = torch.randn_like(tau) * 0.003
             
+            # Compute new sigma using CORRECT inverse transform
+            new_sigma_real = (sigma / scale_factor).clamp(min=SIGMA_OFFSET + 1e-6)
+            new_sigma1 = _sigma_real_to_logit(new_sigma_real)
+            
             # Atom 1
-            new_amp1 = self._amplitude_logit.data[indices].clone() - 0.3
+            parent_amp = self.amplitude[indices]
+            new_amp_real = (parent_amp * SPLIT_AMP_SCALE).clamp(min=1e-6)
+            new_amp1 = _inv_softplus(new_amp_real)
             new_tau1 = (tau - offset + tau_jitter1).clamp(0, self.audio_duration - 1e-6)
             new_omega1 = self._omega_logit.data[indices].clone() + torch.randn_like(self._omega_logit.data[indices]) * 0.05
-            new_sigma1 = self._sigma_logit.data[indices].clone() - math.log(scale_factor)
             new_phi_vector1 = self._phi_vector.data[indices].clone()
             new_gamma1 = self._gamma.data[indices].clone()
             
             # Atom 2 (phase shifted by π/2)
-            new_amp2 = self._amplitude_logit.data[indices].clone() - 0.3
+            new_amp2 = new_amp1.clone()
             new_tau2 = (tau + offset + tau_jitter2).clamp(0, self.audio_duration - 1e-6)
             new_omega2 = self._omega_logit.data[indices].clone() - torch.randn_like(self._omega_logit.data[indices]) * 0.05
             new_sigma2 = new_sigma1.clone()

@@ -15,6 +15,7 @@ model:
 # Initialization (Constant-Q)
 initialization:
   constant_q_cycles: 4.0
+  constant_q_use_2pi: true
   sigma_min: 0.001
   sigma_max: 0.100
 
@@ -37,23 +38,62 @@ loss:
   hop_sizes: [512, 256, 128, 32]
   win_lengths: [2048, 1024, 512, 128]
   spectral_weight: 1.0
-  mel_weight: 5.0              # RESTORED: higher for spectral envelope
-  time_domain_weight: 0.1
+  mel_weight: 4.0              # Balanced to reduce stationary banding
+  time_domain_weight: 0.2
   phase_weight: 1.0
   amp_reg_weight: 0.0001
   pre_emp_weight: 2.0
+  hf_weight: 0.3
+  hf_min_freq_ratio: 0.6
+  energy_weight: 0.35
+  gamma_reg_weight: 0.0005
+  phase_reg_weight: 0.1
+  spec_tv_weight: 0.12
+  spec_tv_freq_ratio: 0.5
 
 # Density Control (Simplified)
 density_control:
   grad_threshold: 0.0002
-  prune_amplitude_threshold: 0.0005  # LOWERED: conservative pruning
+  prune_amplitude_threshold: 0.0006  # slightly higher to prune speckle
   densify_from_iter: 500
   densify_until_iter: 10000
   densification_interval: 100
+  densify_reference_duration_s: 3.0
+  densify_min_scale: 0.25
+  densify_max_scale: 2.0
   sigma_diversity_weight: 0.001
   enable_split: true
   cq_cycle_limit: 50.0
   cq_reg_weight: 0.01          # LOWERED: linear penalty
+  boundary_reg_weight: 0.005
+  boundary_reg_k: 12.0
+  clone_strategy: mixed
+  clone_harmonic_prob: 0.3
+  clone_local_jitter_ratio: 0.08
+  clone_harmonic_jitter_ratio: 0.05
+  clone_max_freq_ratio: 0.95
+  clone_tau_jitter_std: 0.005
+  clone_sigma_scale_harmonic: 0.5
+  clone_sigma_scale_local: 0.8
+  clone_sigma_ratio_max: 1.25
+  clone_sigma_max: 0.03
+  prune_sigma_exponent: 0.5
+  prune_sigma_max_boost: 4.0
+  residual_spawn: true
+  residual_spawn_energy_ratio: 0.05
+  residual_spawn_max: 96
+  residual_spawn_fft: 2048
+  residual_spawn_hop: 512
+  residual_selection_strategy: mp_iterative
+  residual_mp_sigma_multiplier: 5.0
+  residual_mp_amp_max: null
+  residual_mp_normalize: true
+  residual_mp_score_min: 0.0
+  residual_amp_scale: 1.0
+  residual_spawn_peaks_per_frame: 4
+  residual_spawn_min_peak_ratio: 0.3
+  residual_spawn_time_jitter_ratio: 0.0
+  residual_spawn_freq_jitter_bins: 0.0
 
 # Output
 output:

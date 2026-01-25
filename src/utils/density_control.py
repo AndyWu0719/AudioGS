@@ -14,6 +14,8 @@ Removed Mechanisms (caused metric degradation):
 - Energy-Aware Pruning (removed consonant transients)
 - Late-Stage Freeze (prevented convergence)
 - Aggressive HF Clone Block (reduced HF detail)
+
+Issue 4 Fix: Import sigma bounds from shared config for consistency.
 """
 
 import torch
@@ -21,17 +23,8 @@ import torch.nn as nn
 from typing import Dict, Optional, Tuple
 import math
 
-# =====================================================
-# SPEECH-AWARE CONSTANTS
-# =====================================================
-# These are based on speech acoustics literature:
-# - Typical phoneme duration: 50-200ms
-# - Consonant transients: 5-30ms
-# - Fundamental frequency range: 80-400Hz
-
-SIGMA_MIN = 0.002         # 2ms - minimum for consonant transients
-SIGMA_MAX = 0.050         # 50ms - maximum for vowel formants
-Q_FACTOR = 4.0            # Gabor quality factor (standard in audio processing)
+# Import shared defaults and parser for initialization config
+from src.utils.config import InitConfig
 
 
 class DensityController:
@@ -49,10 +42,24 @@ class DensityController:
         grad_threshold: float = 0.0002,
         prune_amplitude_threshold: float = 0.0005,
         max_num_atoms: int = 20000,
+        init_config: Optional[dict] = None,
+        clone_sigma_ratio_max: float = 1.25,
+        clone_sigma_max: float = 0.03,
+        prune_sigma_exponent: float = 0.5,
+        prune_sigma_max_boost: float = 4.0,
     ):
         self.grad_threshold = grad_threshold
         self.prune_amplitude_threshold = prune_amplitude_threshold
         self.max_num_atoms = max_num_atoms
+        init_cfg = InitConfig.from_dict(init_config)
+        self.sigma_min = init_cfg.sigma_min
+        self.sigma_max = init_cfg.sigma_max
+        self.q_factor = init_cfg.constant_q_cycles
+        self.constant_q_use_2pi = init_cfg.constant_q_use_2pi
+        self.clone_sigma_ratio_max = clone_sigma_ratio_max
+        self.clone_sigma_max = clone_sigma_max
+        self.prune_sigma_exponent = prune_sigma_exponent
+        self.prune_sigma_max_boost = prune_sigma_max_boost
         
     def get_densification_mask(
         self,
@@ -77,17 +84,24 @@ class DensityController:
         
         # Constant-Q sigma: sigma = Q / omega
         # This is the expected sigma for a "well-formed" Gabor atom
-        expected_sigma = (Q_FACTOR / (omega + 1e-8)).clamp(min=SIGMA_MIN, max=SIGMA_MAX)
+        denom = omega + 1e-8
+        if self.constant_q_use_2pi:
+            denom = 2.0 * math.pi * denom
+        expected_sigma = (self.q_factor / denom).clamp(
+            min=self.sigma_min,
+            max=self.sigma_max,
+        )
         
         # Split: sigma is 2x larger than expected (truly over-extended)
         # This is conservative - only split obviously problematic atoms
         split_threshold = expected_sigma * 2.0
         split_mask = high_grad_mask & (sigma > split_threshold)
         
-        # Clone: sigma is within expectation, NOT high frequency
-        # Relaxed HF limit: 80% Nyquist (was 40%)
-        high_freq_mask = omega > 0.8 * nyquist
-        clone_mask = high_grad_mask & (sigma <= expected_sigma * 1.5) & (~high_freq_mask)
+        # Clone: sigma is within expectation, NOT extreme high frequency
+        high_freq_mask = omega > 0.9 * nyquist
+        clone_mask = high_grad_mask & (sigma <= expected_sigma * self.clone_sigma_ratio_max) & (~high_freq_mask)
+        if self.clone_sigma_max is not None:
+            clone_mask = clone_mask & (sigma <= self.clone_sigma_max)
         
         return split_mask, clone_mask
     
@@ -95,30 +109,23 @@ class DensityController:
         """
         Determine which atoms should be pruned (kept=True).
         
-        AMPLITUDE-BASED PRUNING with HF penalty:
+        AMPLITUDE-BASED PRUNING with smooth HF penalty:
         - Keep atoms with amplitude >= threshold
-        - Atoms > 85% Nyquist: 3x stricter threshold (to remove HF band artifacts)
+        - Apply a continuous HF penalty to avoid sharp banding
         """
         amplitude = model.amplitude
+        sigma = model.sigma
         omega = model.omega
         nyquist = model.nyquist_freq
         
         base_threshold = self.prune_amplitude_threshold
         
-        # Aggressive HF pruning: > 85% Nyquist gets 3x threshold
-        # This removes the HF band artifact from sigmoid saturation
-        very_high_freq_mask = omega > 0.85 * nyquist
-        
-        # Calculate thresholds
-        adaptive_threshold = torch.ones_like(amplitude) * base_threshold
-        
-        # Strong 3x penalty for >85% Nyquist
-        adaptive_threshold[very_high_freq_mask] = base_threshold * 3.0
-        
-        # Aggressive Boundary Pruning (NEW)
-        # Kill atoms stuck at the ceiling (> 82% Nyquist) with 10x penalty
-        ceiling_mask = omega > 0.82 * nyquist
-        adaptive_threshold[ceiling_mask] = base_threshold * 10.0
+        # Smooth HF penalty from 0.8 -> 0.99 Nyquist
+        omega_ratio = omega / (nyquist + 1e-8)
+        hf_boost = torch.clamp((omega_ratio - 0.8) / 0.19, min=0.0, max=1.0)
+        sigma_ratio = (sigma / (self.sigma_min + 1e-8)).clamp(min=1.0, max=self.prune_sigma_max_boost)
+        sigma_boost = sigma_ratio ** self.prune_sigma_exponent
+        adaptive_threshold = base_threshold * (1.0 + 4.0 * hf_boost * hf_boost) * sigma_boost
         
         keep_mask = amplitude >= adaptive_threshold
         return keep_mask
@@ -130,6 +137,7 @@ class DensityController:
         do_split: bool = True,
         do_clone: bool = True,
         do_prune: bool = True,
+        clone_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, int]:
         """
         Perform density control.
@@ -188,7 +196,7 @@ class DensityController:
             any_changes = True
 
         if len(clone_indices) > 0:
-            num_cloned = model.clone_atoms_by_indices(clone_indices)
+            num_cloned = model.clone_atoms_by_indices(clone_indices, clone_config=clone_config)
             stats["cloned"] = num_cloned
             if num_cloned > 0:
                 any_changes = True
@@ -207,6 +215,52 @@ class DensityController:
             model.reset_gradient_accumulators()
         
         return stats
+
+    def add_atoms_from_residual(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        residual: torch.Tensor,
+        num_atoms: int,
+        init_config: Optional[dict] = None,
+        n_fft: int = 2048,
+        hop_length: int = 512,
+        amp_scale: float = 0.3,
+        peaks_per_frame: int = 4,
+        min_peak_ratio: float = 0.25,
+        time_jitter_ratio: float = 0.5,
+        freq_jitter_bins: float = 0.5,
+        selection_strategy: str = "stft_peak",
+        sigma_multiplier: float = 5.0,
+        mp_amp_max: Optional[float] = None,
+        mp_normalize: bool = True,
+        mp_score_min: float = 0.0,
+    ) -> int:
+        """Add residual-guided atoms and update optimizer state."""
+        if num_atoms <= 0:
+            return 0
+        old_params = self._get_param_dict(model)
+        num_added = model.add_atoms_from_residual(
+            residual,
+            num_atoms,
+            init_config=init_config,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            amp_scale=amp_scale,
+            peaks_per_frame=peaks_per_frame,
+            min_peak_ratio=min_peak_ratio,
+            time_jitter_ratio=time_jitter_ratio,
+            freq_jitter_bins=freq_jitter_bins,
+            selection_strategy=selection_strategy,
+            sigma_multiplier=sigma_multiplier,
+            mp_amp_max=mp_amp_max,
+            mp_normalize=mp_normalize,
+            mp_score_min=mp_score_min,
+        )
+        if num_added > 0:
+            self._update_optimizer_state(model, optimizer, old_params, keep_indices=None)
+            model.reset_gradient_accumulators()
+        return num_added
     
     def _get_param_dict(self, model: nn.Module) -> Dict[str, nn.Parameter]:
         return {
@@ -307,13 +361,23 @@ class AdaptiveDensityController(DensityController):
         grad_threshold: float = 0.0002,
         prune_amplitude_threshold: float = 0.0005,
         max_num_atoms: int = 20000,
+        init_config: Optional[dict] = None,
         warmup_iters: int = 100,
         decay_factor: float = 0.995,  # Slower decay
+        clone_sigma_ratio_max: float = 1.25,
+        clone_sigma_max: float = 0.03,
+        prune_sigma_exponent: float = 0.5,
+        prune_sigma_max_boost: float = 4.0,
     ):
         super().__init__(
             grad_threshold=grad_threshold,
             prune_amplitude_threshold=prune_amplitude_threshold,
             max_num_atoms=max_num_atoms,
+            init_config=init_config,
+            clone_sigma_ratio_max=clone_sigma_ratio_max,
+            clone_sigma_max=clone_sigma_max,
+            prune_sigma_exponent=prune_sigma_exponent,
+            prune_sigma_max_boost=prune_sigma_max_boost,
         )
         self.warmup_iters = warmup_iters
         self.decay_factor = decay_factor

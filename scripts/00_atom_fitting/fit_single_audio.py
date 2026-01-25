@@ -23,6 +23,7 @@ Usage:
 import os
 import sys
 import argparse
+import math
 import yaml
 from pathlib import Path
 from datetime import datetime
@@ -42,6 +43,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "cuda_gabor"))
 from src.models.atom import AudioGSModel
 from src.losses.spectral_loss import CombinedAudioLoss
 from src.utils.density_control import AdaptiveDensityController, rebuild_optimizer_from_model
+from src.utils.config import InitConfig
 from src.utils.visualization import Visualizer
 from src.tools.metrics import compute_mss_loss, compute_pesq, compute_sisdr
 
@@ -61,6 +63,9 @@ except ImportError:
         print("[Renderer] Using local cuda_gabor")
     except ImportError:
         print("[Warning] CUDA extension not available, will use PyTorch fallback")
+
+# Import CPU renderer from shared package (Issue 1 fix)
+from src.renderers.cpu_renderer import render_pytorch
 
 # ============================================================
 # BENCHMARK TEST FILES (Pre-selected via torchaudio.info)
@@ -239,7 +244,11 @@ def fit_single_audio(
     )
     
     # Initialize from audio (uses Constant-Q sigma internally)
-    model.initialize_from_audio(gt_waveform)
+    # Issue D: Pass config to wire YAML fields to initialization
+    model.initialize_from_audio(
+        gt_waveform,
+        init_config=config.get("initialization", {})
+    )
     
     # Renderer
     if CUDA_EXT_AVAILABLE:
@@ -266,6 +275,13 @@ def fit_single_audio(
         phase_weight=loss_config.get("phase_weight", 1.0),
         amp_reg_weight=loss_config.get("amp_reg_weight", 0.0001),
         pre_emp_weight=loss_config.get("pre_emp_weight", 2.0),
+        hf_weight=loss_config.get("hf_weight", 0.0),
+        hf_min_freq_ratio=loss_config.get("hf_min_freq_ratio", 0.6),
+        energy_weight=loss_config.get("energy_weight", 0.0),
+        gamma_reg_weight=loss_config.get("gamma_reg_weight", 0.0),
+        phase_reg_weight=loss_config.get("phase_reg_weight", 0.1),
+        spec_tv_weight=loss_config.get("spec_tv_weight", 0.0),
+        spec_tv_freq_ratio=loss_config.get("spec_tv_freq_ratio", 0.5),
     )
     
     # Optimizer
@@ -278,16 +294,61 @@ def fit_single_audio(
     
     # Density Controller - Simplified speech-aware design
     dc = config["density_control"]
+    densify_from_iter = dc["densify_from_iter"]
+    densify_until_iter = dc["densify_until_iter"]
+    densification_interval = dc["densification_interval"]
+    ref_duration = dc.get("densify_reference_duration_s", 3.0)
+    min_scale = dc.get("densify_min_scale", 0.25)
+    max_scale = dc.get("densify_max_scale", 2.0)
+    scale = max(min(audio_duration / ref_duration, max_scale), min_scale)
+    densify_from_iter = max(1, int(densify_from_iter * scale))
+    densification_interval = max(1, int(densification_interval * scale))
+    densify_until_iter = max(densify_until_iter, densify_from_iter + densification_interval)
     density_controller = AdaptiveDensityController(
         grad_threshold=dc["grad_threshold"],
         prune_amplitude_threshold=dc["prune_amplitude_threshold"],
         max_num_atoms=max_num_atoms,
+        init_config=config.get("initialization", {}),
+        clone_sigma_ratio_max=dc.get("clone_sigma_ratio_max", 1.25),
+        clone_sigma_max=dc.get("clone_sigma_max", 0.03),
+        prune_sigma_exponent=dc.get("prune_sigma_exponent", 0.5),
+        prune_sigma_max_boost=dc.get("prune_sigma_max_boost", 4.0),
     )
     enable_split = dc.get("enable_split", True)
+    residual_spawn = dc.get("residual_spawn", True)
+    residual_spawn_energy_ratio = dc.get("residual_spawn_energy_ratio", 0.05)
+    residual_spawn_max = dc.get("residual_spawn_max", 128)
+    residual_spawn_fft = dc.get("residual_spawn_fft", 2048)
+    residual_spawn_hop = dc.get("residual_spawn_hop", 512)
+    residual_amp_scale = dc.get("residual_amp_scale", 0.3)
+    residual_peaks_per_frame = dc.get("residual_spawn_peaks_per_frame", 4)
+    residual_min_peak_ratio = dc.get("residual_spawn_min_peak_ratio", 0.25)
+    residual_time_jitter_ratio = dc.get("residual_spawn_time_jitter_ratio", 0.5)
+    residual_freq_jitter_bins = dc.get("residual_spawn_freq_jitter_bins", 0.5)
+    residual_selection_strategy = dc.get("residual_selection_strategy", "stft_peak")
+    residual_mp_sigma_multiplier = dc.get("residual_mp_sigma_multiplier", 5.0)
+    residual_mp_amp_max = dc.get("residual_mp_amp_max", None)
+    residual_mp_normalize = dc.get("residual_mp_normalize", True)
+    residual_mp_score_min = dc.get("residual_mp_score_min", 0.0)
+    if isinstance(residual_mp_amp_max, (int, float)) and residual_mp_amp_max <= 0:
+        residual_mp_amp_max = None
     
     # Linear CQ Regularization (soft penalty, NOT exponential barrier)
     cq_cycle_limit = dc.get("cq_cycle_limit", 50.0)
     cq_reg_weight = dc.get("cq_reg_weight", 0.01)  # Gentle weight
+    init_cfg = InitConfig.from_dict(config.get("initialization", {}))
+    q_multiplier = 2.0 * math.pi if init_cfg.constant_q_use_2pi else 1.0
+
+    clone_config = {
+        "strategy": dc.get("clone_strategy", "harmonic"),
+        "harmonic_prob": dc.get("clone_harmonic_prob", 0.5),
+        "local_jitter_ratio": dc.get("clone_local_jitter_ratio", 0.08),
+        "harmonic_jitter_ratio": dc.get("clone_harmonic_jitter_ratio", 0.05),
+        "max_freq_ratio": dc.get("clone_max_freq_ratio", 0.95),
+        "tau_jitter_std": dc.get("clone_tau_jitter_std", 0.005),
+        "sigma_scale_harmonic": dc.get("clone_sigma_scale_harmonic", 0.5),
+        "sigma_scale_local": dc.get("clone_sigma_scale_local", 0.8),
+    }
     
     # Training loop
     pbar = tqdm(range(max_iters), desc=f"Fitting {filename}", leave=False)
@@ -316,7 +377,9 @@ def fit_single_audio(
             model_amplitude=amplitude,
             model_sigma=sigma,
             model_phase_raw=phase_vector,
+            model_gamma=gamma,
             sigma_diversity_weight=dc.get("sigma_diversity_weight", 0.001),
+            phase_reg_weight=loss_config.get("phase_reg_weight", 0.1),
         )
         
         # =====================================================
@@ -325,14 +388,14 @@ def fit_single_audio(
         # Gently penalize atoms exceeding cycle limit
         # Linear is more stable than exponential barrier
         
-        current_cycles = sigma * omega
-        cq_reg_loss = cq_reg_weight * F.relu(current_cycles - cq_cycle_limit).mean()
+        current_q = q_multiplier * sigma * omega
+        cq_reg_loss = cq_reg_weight * F.relu(current_q - cq_cycle_limit).mean()
         
-        # Boundary Repulsion Loss (NEW)
-        # Penalize atoms approaching the 99% Nyquist limit
-        # Formula: 0.01 * exp((omega / limit) * 20 - 20) -> Steeper penalty
+        # Boundary Repulsion Loss (configurable)
         freq_limit = 0.99 * model.nyquist_freq
-        boundary_loss = 0.01 * torch.exp((omega / freq_limit) * 20 - 20).mean()
+        boundary_weight = dc.get("boundary_reg_weight", 0.01)
+        boundary_k = dc.get("boundary_reg_k", 20.0)
+        boundary_loss = boundary_weight * torch.exp((omega / freq_limit) * boundary_k - boundary_k).mean()
         
         loss = loss + cq_reg_loss + boundary_loss
         loss_dict['cq_reg'] = cq_reg_loss.item()
@@ -344,18 +407,49 @@ def fit_single_audio(
         model.accumulate_gradients()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        model.clamp_parameters()
         scheduler.step()
         
         # Density control (simplified, no late-stage freeze)
         density_controller.update_thresholds(loss.item())
-        if dc["densify_from_iter"] <= iteration < dc["densify_until_iter"]:
-            if iteration % dc["densification_interval"] == 0 and iteration > 0:
+        if densify_from_iter <= iteration < densify_until_iter:
+            if iteration % densification_interval == 0 and iteration > 0:
                 stats = density_controller.densify_and_prune(
                     model, optimizer,
                     do_split=enable_split,
                     do_clone=True,
                     do_prune=True,
+                    clone_config=clone_config,
                 )
+                if residual_spawn:
+                    with torch.no_grad():
+                        residual = (gt_waveform - pred_waveform).detach()
+                        residual_energy = (residual ** 2).mean()
+                        target_energy = (gt_waveform ** 2).mean()
+                        ratio = residual_energy / (target_energy + 1e-8)
+                    if ratio > residual_spawn_energy_ratio:
+                        remaining_budget = max_num_atoms - model.num_atoms
+                        num_new = min(remaining_budget, residual_spawn_max)
+                        if num_new > 0:
+                            density_controller.add_atoms_from_residual(
+                                model,
+                                optimizer,
+                                residual,
+                                num_new,
+                                init_config=config.get("initialization", {}),
+                                n_fft=residual_spawn_fft,
+                                hop_length=residual_spawn_hop,
+                                amp_scale=residual_amp_scale,
+                                peaks_per_frame=residual_peaks_per_frame,
+                                min_peak_ratio=residual_min_peak_ratio,
+                                time_jitter_ratio=residual_time_jitter_ratio,
+                                freq_jitter_bins=residual_freq_jitter_bins,
+                                selection_strategy=residual_selection_strategy,
+                                sigma_multiplier=residual_mp_sigma_multiplier,
+                                mp_amp_max=residual_mp_amp_max,
+                                mp_normalize=residual_mp_normalize,
+                                mp_score_min=residual_mp_score_min,
+                            )
         
         # Logging
         if iteration % config["training"]["log_interval"] == 0:
@@ -414,30 +508,7 @@ def fit_single_audio(
     return metrics
 
 
-def render_pytorch(
-    amplitude, tau, omega, sigma, phi, gamma,
-    num_samples, sample_rate, device
-) -> torch.Tensor:
-    """PyTorch fallback renderer (slower than CUDA)."""
-    t = torch.arange(num_samples, device=device, dtype=torch.float32) / sample_rate
-    output = torch.zeros(num_samples, device=device)
-    
-    for i in range(len(amplitude)):
-        A = amplitude[i]
-        tau_i = tau[i]
-        omega_i = omega[i]
-        sigma_i = sigma[i]
-        phi_i = phi[i]
-        gamma_i = gamma[i]
-        
-        t_centered = t - tau_i
-        envelope = torch.exp(-t_centered**2 / (2 * sigma_i**2 + 1e-8))
-        phase = 2 * 3.14159 * (omega_i * t_centered + 0.5 * gamma_i * t_centered**2) + phi_i
-        carrier = torch.cos(phase)
-        
-        output += A * envelope * carrier
-    
-    return output
+# render_pytorch is now imported from src.renderers.cpu_renderer (Issue 1 fix)
 
 
 def main():

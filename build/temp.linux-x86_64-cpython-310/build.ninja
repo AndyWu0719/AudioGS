@@ -23,8 +23,8 @@ rule cuda_compile
 
 
 
-build /data0/determined/users/andywu/GS-TS/cuda_gabor/build/temp.linux-x86_64-cpython-310/csrc/ext.o: compile /data0/determined/users/andywu/GS-TS/cuda_gabor/csrc/ext.cpp
-build /data0/determined/users/andywu/GS-TS/cuda_gabor/build/temp.linux-x86_64-cpython-310/csrc/gabor_render.o: cuda_compile /data0/determined/users/andywu/GS-TS/cuda_gabor/csrc/gabor_render.cu
+build /data0/determined/users/andywu/GS-TS/build/temp.linux-x86_64-cpython-310/csrc/ext.o: compile /data0/determined/users/andywu/GS-TS/csrc/ext.cpp
+build /data0/determined/users/andywu/GS-TS/build/temp.linux-x86_64-cpython-310/csrc/gabor_render.o: cuda_compile /data0/determined/users/andywu/GS-TS/csrc/gabor_render.cu
 
 
 

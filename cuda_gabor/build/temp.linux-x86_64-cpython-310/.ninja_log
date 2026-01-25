@@ -1,4 +1,3 @@
 # ninja log v7
-0	857	1768761105493848250	/data0/determined/users/andywu/GS-TS/cuda_gabor/build/temp.linux-x86_64-cpython-310/csrc/gabor_render.o	bb32bf87b9c2890
-0	16552	1768761105493848250	/data0/determined/users/andywu/GS-TS/cuda_gabor/build/temp.linux-x86_64-cpython-310/csrc/ext.o	e27f3f7589a08a68
-11	854	1768803641886489277	/data0/determined/users/andywu/GS-TS/cuda_gabor/build/temp.linux-x86_64-cpython-310/csrc/gabor_render.o	bb32bf87b9c2890
+1	2509	1769357245327544778	/data0/determined/users/andywu/GS-TS/cuda_gabor/build/temp.linux-x86_64-cpython-310/csrc/gabor_render.o	8b0a1ed47fbbfa5
+0	17030	1769357245327544778	/data0/determined/users/andywu/GS-TS/cuda_gabor/build/temp.linux-x86_64-cpython-310/csrc/ext.o	e27f3f7589a08a68

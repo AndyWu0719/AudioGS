@@ -56,8 +56,11 @@ __global__ void gabor_forward_kernel(
     // Skip atoms with negligible amplitude
     if (fabsf(A) < 1e-8f) return;
     
-    const float sigma_sq = sigma_i * sigma_i + 1e-8f;
-    const float window_bound = sigma_i * sigma_mult;
+    // Consistent sigma clamp with backward kernel (1ms minimum)
+    // This ensures forward/backward equivalence for sigma in [0.0005, 0.001)
+    const float sigma_clamped = fmaxf(sigma_i, 0.001f);
+    const float sigma_sq = sigma_clamped * sigma_clamped;
+    const float window_bound = sigma_clamped * sigma_mult;
     
     // Compute window bounds in sample indices
     const int window_start = max(0, (int)((tau_i - window_bound) * sample_rate));
@@ -72,7 +75,7 @@ __global__ void gabor_forward_kernel(
         // Envelope
         const float envelope = expf(-t_sq / (2.0f * sigma_sq));
         
-        // NEW: Soft windowing with Hann taper to eliminate truncation artifacts
+        // Soft windowing with Hann taper to eliminate truncation artifacts
         // Apply taper in outer 20% of window to ensure smooth transition to zero
         const float normalized_dist = fabsf(t_centered) / window_bound;  // [0, 1]
         float window_factor = 1.0f;
@@ -163,6 +166,15 @@ __global__ void gabor_backward_kernel(
         
         // Envelope
         const float envelope = expf(-t_sq / (2.0f * sigma_sq));
+
+        // Match forward Hann taper (treat as constant factor in backward)
+        const float normalized_dist = fabsf(t_centered) / window_bound;  // [0, 1]
+        float window_factor = 1.0f;
+        if (normalized_dist > 0.8f) {
+            float edge_t = (normalized_dist - 0.8f) / 0.2f;
+            window_factor = 0.5f * (1.0f + cosf(PI * edge_t));
+        }
+        const float envelope_w = envelope * window_factor;
         
         // Phase and carrier
         const float phase = TWO_PI * (omega_i * t_centered + 0.5f * gamma_i * t_sq) + phi_i;
@@ -175,7 +187,8 @@ __global__ void gabor_backward_kernel(
         //                    = envelope * (t_centered)/sigma^2 * (-1)
         //                    = envelope * t_centered / sigma^2
         const float d_envelope_d_tau = envelope * t_centered / sigma_sq;  // Fixed: removed incorrect negative sign
-        const float d_envelope_d_sigma = envelope * t_sq / (sigma_i * sigma_sq);
+        // Use sigma_clamped consistently (not raw sigma_i) to prevent divide-by-near-zero
+        const float d_envelope_d_sigma = envelope * t_sq / (sigma_clamped * sigma_sq);
 
         
         // Carrier derivatives
@@ -185,12 +198,12 @@ __global__ void gabor_backward_kernel(
         const float d_carrier_d_gamma = -sin_phase * PI * t_sq;
         
         // Accumulate gradients
-        grad_A_acc += grad_out * envelope * carrier;
-        grad_tau_acc += grad_out * A * (d_envelope_d_tau * carrier + envelope * d_carrier_d_tau);
-        grad_omega_acc += grad_out * A * envelope * d_carrier_d_omega;
-        grad_sigma_acc += grad_out * A * d_envelope_d_sigma * carrier;
-        grad_phi_acc += grad_out * A * envelope * d_carrier_d_phi;
-        grad_gamma_acc += grad_out * A * envelope * d_carrier_d_gamma;
+        grad_A_acc += grad_out * envelope_w * carrier;
+        grad_tau_acc += grad_out * A * (d_envelope_d_tau * window_factor * carrier + envelope_w * d_carrier_d_tau);
+        grad_omega_acc += grad_out * A * envelope_w * d_carrier_d_omega;
+        grad_sigma_acc += grad_out * A * d_envelope_d_sigma * window_factor * carrier;
+        grad_phi_acc += grad_out * A * envelope_w * d_carrier_d_phi;
+        grad_gamma_acc += grad_out * A * envelope_w * d_carrier_d_gamma;
     }
     
     // Write gradients with soft clipping to prevent explosion

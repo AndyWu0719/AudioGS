@@ -320,9 +320,9 @@ class AGSInferenceEngine:
         # Density controller
         density_controller = AdaptiveDensityController(
             grad_threshold=0.0002,
-            sigma_split_threshold=0.01,
             prune_amplitude_threshold=0.001,
             max_num_atoms=max_atoms,
+            init_config=cfg.get("initialization", {}),
         )
         
         # Optimization loop
@@ -338,6 +338,7 @@ class AGSInferenceEngine:
             model.accumulate_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            model.clamp_parameters()
             
             # Density control
             density_controller.update_thresholds(loss.item())

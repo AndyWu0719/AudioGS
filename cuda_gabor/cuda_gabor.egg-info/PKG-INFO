@@ -1,6 +1,0 @@
-Metadata-Version: 2.4
-Name: cuda_gabor
-Version: 0.1.0
-Summary: CUDA-accelerated Gabor atom rendering
-Requires-Python: >=3.8
-Requires-Dist: torch

@@ -431,6 +431,13 @@ class CombinedAudioLoss(nn.Module):
         phase_weight: float = 0.5,
         amp_reg_weight: float = 0.01,
         pre_emp_weight: float = 20.0,
+        hf_weight: float = 0.0,
+        hf_min_freq_ratio: float = 0.6,
+        energy_weight: float = 0.0,
+        gamma_reg_weight: float = 0.0,
+        phase_reg_weight: float = 0.1,
+        spec_tv_weight: float = 0.0,
+        spec_tv_freq_ratio: float = 0.5,
     ):
         super().__init__()
         
@@ -454,6 +461,13 @@ class CombinedAudioLoss(nn.Module):
         self.phase_weight = phase_weight
         self.amp_reg_weight = amp_reg_weight
         self.pre_emp_weight = pre_emp_weight
+        self.hf_weight = hf_weight
+        self.hf_min_freq_ratio = hf_min_freq_ratio
+        self.energy_weight = energy_weight
+        self.gamma_reg_weight = gamma_reg_weight
+        self.phase_reg_weight = phase_reg_weight
+        self.spec_tv_weight = spec_tv_weight
+        self.spec_tv_freq_ratio = spec_tv_freq_ratio
         
         self.stft_loss = MultiResolutionSTFTLoss(
             fft_sizes=fft_sizes,
@@ -493,7 +507,8 @@ class CombinedAudioLoss(nn.Module):
         model_sigma: Optional[torch.Tensor] = None,
         model_phase_raw: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         sigma_diversity_weight: float = 0.001,
-        phase_reg_weight: float = 0.1,
+        phase_reg_weight: Optional[float] = None,
+        model_gamma: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute combined audio loss.
@@ -547,7 +562,67 @@ class CombinedAudioLoss(nn.Module):
         pred_emp = self.pre_emphasis(pred)
         target_emp = self.pre_emphasis(target)
         pre_emp_loss = F.l1_loss(pred_emp, target_emp)
+
+        # 5a. Short-time energy envelope loss
+        energy_loss = 0.0
+        if self.energy_weight > 0.0:
+            if 1024 in pred_stft_dict:
+                pred_mag_1024 = pred_stft_dict[1024][0]
+                target_mag_1024 = target_stft_dict[1024][0]
+            else:
+                first_key = self.fft_sizes[0]
+                pred_mag_1024 = pred_stft_dict[first_key][0]
+                target_mag_1024 = target_stft_dict[first_key][0]
+            pred_energy = torch.log(pred_mag_1024.pow(2).mean(dim=-2) + 1e-8)
+            target_energy = torch.log(target_mag_1024.pow(2).mean(dim=-2) + 1e-8)
+            energy_loss = F.l1_loss(pred_energy, target_energy)
+
+        # 5b. High-frequency STFT loss (direct HF detail emphasis)
+        hf_loss = 0.0
+        if self.hf_weight > 0.0:
+            hf_total = 0.0
+            hf_scales = 0
+            for fft_size in self.fft_sizes:
+                pred_mag, _ = pred_stft_dict[fft_size]
+                target_mag, _ = target_stft_dict[fft_size]
+                cutoff_bin = int(pred_mag.shape[-2] * self.hf_min_freq_ratio)
+                if cutoff_bin < pred_mag.shape[-2]:
+                    pred_hf = pred_mag[:, cutoff_bin:, :]
+                    target_hf = target_mag[:, cutoff_bin:, :]
+                    hf_total += F.l1_loss(
+                        torch.log(pred_hf + 1e-8),
+                        torch.log(target_hf + 1e-8),
+                    )
+                    hf_scales += 1
+            if hf_scales > 0:
+                hf_loss = hf_total / hf_scales
         
+        # 5c. Spectrogram smoothness matching (reduce speckle while preserving GT texture)
+        spec_tv_loss = 0.0
+        if self.spec_tv_weight > 0.0:
+            if 1024 in pred_stft_dict:
+                pred_mag_tv = pred_stft_dict[1024][0]
+                target_mag_tv = target_stft_dict[1024][0]
+            else:
+                first_key = self.fft_sizes[0]
+                pred_mag_tv = pred_stft_dict[first_key][0]
+                target_mag_tv = target_stft_dict[first_key][0]
+
+            n_bins = pred_mag_tv.shape[-2]
+            start_bin = int(n_bins * self.spec_tv_freq_ratio)
+            pred_log = torch.log(pred_mag_tv + 1e-8)
+            target_log = torch.log(target_mag_tv + 1e-8)
+
+            pred_sel = pred_log[:, start_bin:, :]
+            target_sel = target_log[:, start_bin:, :]
+
+            pred_tv_t = (pred_sel[:, :, 1:] - pred_sel[:, :, :-1]).abs()
+            target_tv_t = (target_sel[:, :, 1:] - target_sel[:, :, :-1]).abs()
+            pred_tv_f = (pred_sel[:, 1:, :] - pred_sel[:, :-1, :]).abs()
+            target_tv_f = (target_sel[:, 1:, :] - target_sel[:, :-1, :]).abs()
+
+            spec_tv_loss = F.l1_loss(pred_tv_t, target_tv_t) + F.l1_loss(pred_tv_f, target_tv_f)
+
         # 6. Regularization
         amp_reg = 0.0
         if model_amplitude is not None:
@@ -566,6 +641,13 @@ class CombinedAudioLoss(nn.Module):
             cos_raw, sin_raw = model_phase_raw
             radius_sq = cos_raw**2 + sin_raw**2
             phase_reg = ((radius_sq - 1.0)**2).mean()
+
+        gamma_reg = 0.0
+        if model_gamma is not None and self.gamma_reg_weight > 0.0:
+            gamma_reg = (model_gamma ** 2).mean()
+
+        if phase_reg_weight is None:
+            phase_reg_weight = self.phase_reg_weight
         
         # Combine all losses
         total_loss = (
@@ -576,7 +658,11 @@ class CombinedAudioLoss(nn.Module):
             self.amp_reg_weight * amp_reg +
             sigma_diversity_weight * sigma_div +
             self.pre_emp_weight * pre_emp_loss +
-            phase_reg_weight * phase_reg
+            phase_reg_weight * phase_reg +
+            self.hf_weight * hf_loss +
+            self.energy_weight * energy_loss +
+            self.gamma_reg_weight * gamma_reg +
+            self.spec_tv_weight * spec_tv_loss
         )
         
         loss_dict = {
@@ -585,7 +671,11 @@ class CombinedAudioLoss(nn.Module):
             "time": time_loss.item(),
             "phase": phase_loss.item(),
             "pre_emp": pre_emp_loss.item(),
+            "energy": energy_loss if isinstance(energy_loss, float) else energy_loss.item(),
+            "hf": hf_loss if isinstance(hf_loss, float) else hf_loss.item(),
+            "spec_tv": spec_tv_loss if isinstance(spec_tv_loss, float) else spec_tv_loss.item(),
             "phase_reg": phase_reg if isinstance(phase_reg, float) else phase_reg.item(),
+            "gamma_reg": gamma_reg if isinstance(gamma_reg, float) else gamma_reg.item(),
             "total": total_loss.item(),
         }
         
