@@ -12,7 +12,7 @@ source $(conda info --base)/etc/profile.d/conda.sh
 conda activate qwen2_CALM
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 CONFIG="${CONFIG:-configs/flow_config.yaml}"
@@ -20,22 +20,22 @@ NUM_GPUS="${NUM_GPUS:-4}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 EXP_NAME="${EXP_NAME:-}"
 RESUME="${RESUME:-}"
+CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 
 echo "============================================================"
 echo "Flow Matching - Multi-GPU DDP Training"
 echo "============================================================"
 echo "Config: $CONFIG"
 echo "GPUs: $NUM_GPUS"
+if [[ -n "$CUDA_DEVICES" ]]; then
+    echo "CUDA_VISIBLE_DEVICES: $CUDA_DEVICES"
+fi
 echo "Resume: ${RESUME:-disabled}"
 echo "============================================================"
 
 RESUME_ARGS=""
 if [[ -n "$RESUME" ]]; then
-    if [[ "$RESUME" == "1" || "$RESUME" == "true" ]]; then
-        RESUME_ARGS="--resume"
-    else
-        RESUME_ARGS="--resume --checkpoint $RESUME"
-    fi
+    RESUME_ARGS="--resume $RESUME"
 fi
 
 torchrun \
@@ -43,7 +43,6 @@ torchrun \
     --master_port=$MASTER_PORT \
     scripts/04_flow_training/run_flow_train.py \
     --config "$CONFIG" \
-    ${EXP_NAME:+--exp_name "$EXP_NAME"} \
     $RESUME_ARGS
 
 echo "DDP Training complete!"

@@ -1,0 +1,54 @@
+# Stage01: Gabor-frame Codec (AE/VAE) Configuration
+
+data:
+  dataset_root: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R/train"
+  subsets: ["train-clean-100", "train-clean-360", "train-other-500"]
+  # Optional: use a separate validation set instead of splitting train.
+  # If set and non-empty, Stage01 will validate on this dataset.
+  val_dataset_root: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R/dev"
+  val_subsets: ["dev-clean"]
+  sample_rate: 24000
+  segment_seconds: 3.0
+  min_seconds: 1.0
+
+gabor_frame:
+  n_fft: 1024
+  hop_length: 512
+  win_length: 1024
+  window: "gaussian"          # "hann" | "gaussian"
+  gaussian_std_frac: 0.125
+  center: true
+  pad_mode: "reflect"
+
+model:
+  latent_dim: 128
+  hidden_dim: 768
+  num_layers: 8
+  time_downsample: 4          # z frame-rate = STFT_frames / time_downsample
+  use_vae: false              # recommend AE first; if true, also set loss.weights.kl > 0
+  dropout: 0.05
+
+loss:
+  weights:
+    time_l1: 1.0
+    stft_mss: 1.0
+    kl: 0.0                   # (AE) ignored unless model.use_vae=true
+    latent_l1: 0.0
+  mss:
+    fft_sizes: [2048, 1024, 512]
+
+training:
+  batch_size: 32               # per GPU
+  accumulation_steps: 1
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-2
+  max_steps: 200000
+  warmup_steps: 2000
+  grad_clip: 1.0
+  log_interval: 20
+  val_interval: 2000
+  save_interval: 10000
+
+output:
+  dir: "logs/codec"
+  save_audio: true

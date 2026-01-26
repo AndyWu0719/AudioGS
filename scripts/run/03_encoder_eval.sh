@@ -2,7 +2,7 @@
 # ============================================================
 # 03: Encoder Evaluation
 # ============================================================
-# Evaluates atom reconstruction quality (PESQ, STOI, SI-SDR, MCD)
+# Evaluates codec reconstruction quality (PESQ, SI-SDR, MSS, SNR)
 # ============================================================
 
 set -e
@@ -11,23 +11,29 @@ source $(conda info --base)/etc/profile.d/conda.sh
 conda activate qwen2_CALM
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-DATA_DIR="${1:-data/atoms/LibriTTS_R/train/train-clean-100}"
-MAX_SAMPLES="${MAX_SAMPLES:-100}"
+CHECKPOINT="${1:-logs/codec/checkpoints/final.pt}"
+CODEC_CONFIG="${CODEC_CONFIG:-configs/codec_config.yaml}"
+DATA_DIR="${2:-data/raw/LibriTTS_R/dev/dev-clean}"
+NUM_SAMPLES="${NUM_SAMPLES:-20}"
 GPU="${GPU:-0}"
 
 echo "============================================================"
-echo "AudioGS - Encoder Evaluation"
+echo "AudioGS - Codec Evaluation"
 echo "============================================================"
+echo "Checkpoint: $CHECKPOINT"
+echo "Codec config: $CODEC_CONFIG"
 echo "Data dir: $DATA_DIR"
-echo "Max samples: $MAX_SAMPLES"
+echo "Samples: $NUM_SAMPLES"
 echo "============================================================"
 
 CUDA_VISIBLE_DEVICES=$GPU python scripts/03_encoder_eval/run_encoder_eval.py \
+    --checkpoint "$CHECKPOINT" \
+    --codec_config "$CODEC_CONFIG" \
     --data_dir "$DATA_DIR" \
-    --max_samples "$MAX_SAMPLES"
+    --num_samples "$NUM_SAMPLES"
 
 echo "============================================================"
 echo "Evaluation complete!"

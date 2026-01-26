@@ -1,8 +1,8 @@
 #!/bin/bash
 # ============================================================
-# 05: Flow/TTS Evaluation
+# 05: Flow Evaluation (paired)
 # ============================================================
-# Evaluates TTS quality using WER and Speaker Similarity.
+# Samples audio from Flow-on-latents and (optionally) compares to paired GT.
 # ============================================================
 
 set -e
@@ -11,25 +11,26 @@ source $(conda info --base)/etc/profile.d/conda.sh
 conda activate qwen2_CALM
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-CHECKPOINT="${1:-logs/flow/best.pt}"
-DATA_DIR="${2:-data/atoms/LibriTTS_R/train/train-clean-100}"
-NUM_SAMPLES="${NUM_SAMPLES:-50}"
+CHECKPOINT="${1:-logs/flow_latent/checkpoints/final.pt}"
+FLOW_CONFIG="${FLOW_CONFIG:-configs/flow_config.yaml}"
+NUM_SAMPLES="${NUM_SAMPLES:-10}"
 GPU="${GPU:-0}"
 
 echo "============================================================"
-echo "AudioGS - TTS Evaluation"
+echo "AudioGS - Flow Evaluation"
 echo "============================================================"
 echo "Checkpoint: $CHECKPOINT"
-echo "Data dir: $DATA_DIR"
+echo "Config: $FLOW_CONFIG"
 echo "Samples: $NUM_SAMPLES"
 echo "============================================================"
 
 CUDA_VISIBLE_DEVICES=$GPU python scripts/05_flow_eval/run_flow_eval.py \
-    --checkpoint "$CHECKPOINT" \
-    --data_dir "$DATA_DIR" \
-    --num_samples "$NUM_SAMPLES"
+    --flow_ckpt "$CHECKPOINT" \
+    --flow_config "$FLOW_CONFIG" \
+    --num_samples "$NUM_SAMPLES" \
+    --out_dir "${OUT_DIR:-logs/flow_eval}"
 
 echo "Evaluation complete!"

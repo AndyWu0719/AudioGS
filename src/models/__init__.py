@@ -1,11 +1,11 @@
-"""Audio Gaussian Splatting Models."""
+"""Models: codec + Flow Matching."""
 
-from .atom import AudioGSModel
 from .flow_dit import FlowDiT, get_flow_model
 from .flow_matching import ConditionalFlowMatching, FlowODESolver
+from .gabor_codec import GaborFrameCodec
 
 __all__ = [
-    "AudioGSModel",
+    "GaborFrameCodec",
     "FlowDiT",
     "get_flow_model",
     "ConditionalFlowMatching",

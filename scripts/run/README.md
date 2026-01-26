@@ -6,8 +6,11 @@ Shell launchers for the AudioGS pipeline. All scripts include conda environment 
 
 | Script | Description |
 |--------|-------------|
-| `01_encoder_debug.sh` | Single audio debug training for encoder |
-| `03_encoder_eval.sh` | Evaluate encoder reconstruction quality |
-| `04_flow_ddp.sh` | Multi-GPU Flow Matching training |
-| `05_eval_tts.sh` | TTS quality evaluation (WER, Speaker Similarity) |
-| `06_tts_inference.sh` | TTS inference (text to audio generation) |
+| `00_atom_fitting.sh` | Stage00 Gabor-frame (STFT/ISTFT) benchmark |
+| `01_encoder_ddp.sh` | Stage01 codec training (DDP, multi-GPU) |
+| `01_encoder_debug.sh` | Stage01 codec training (debug, single GPU) |
+| `02_preprocess_latents.sh` | Stage02 preprocess dataset into latents |
+| `03_encoder_eval.sh` | Stage03 codec reconstruction eval |
+| `04_flow_ddp.sh` | Stage04 Flow Matching training (DDP) |
+| `05_eval_tts.sh` | Stage05 Flow eval (paired sampling) |
+| `06_tts_inference.sh` | Stage06 TTS inference (text → audio) |

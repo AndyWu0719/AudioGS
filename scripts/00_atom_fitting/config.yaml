@@ -1,0 +1,28 @@
+# Stage 00: Gabor Frame (STFT/ISTFT) Reconstruction (scripts/00_atom_fitting)
+#
+# Goal: demonstrate that a (windowed) Gabor dictionary can reconstruct audio
+# near-perfectly with a clean, deterministic analysis/synthesis pipeline.
+
+data:
+  dataset_path: "/data0/determined/users/andywu/GS-TS/data/raw/LibriTTS_R/train/train-clean-100"
+  sample_rate: 24000
+
+method: "gabor_frame"
+
+gabor_frame:
+  n_fft: 1024
+  hop_length: 512
+  win_length: 1024
+  window: "gaussian"          # "hann" | "gaussian"
+  gaussian_std_frac: 0.125    # std = win_length * frac (only for gaussian)
+  center: true
+  pad_mode: "reflect"
+  sparsify:
+    enabled: false
+    mode: "topk_per_frame"    # "topk" | "topk_per_frame" | "threshold_db"
+    topk: 64
+    threshold_db: -80.0
+
+output:
+  root_dir: "logs/00_atom_fitting"
+  save_atoms: true

@@ -3,3 +3,5 @@ logs
 data
 .vscode
 .agent
+__pycache__/
+*.pyc
