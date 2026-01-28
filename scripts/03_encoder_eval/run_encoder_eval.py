@@ -60,6 +60,7 @@ def build_codec(ckpt_path: Path, cfg: Dict[str, Any], device: torch.device) -> T
         time_downsample=int(m.get("time_downsample", 4)),
         use_vae=bool(m.get("use_vae", False)),
         dropout=float(m.get("dropout", 0.0)),
+        dilation_schedule=tuple(m.get("dilation_schedule", [])) or None,
     ).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -107,6 +108,7 @@ def main():
     parser.add_argument("--num_samples", type=int, default=20)
     parser.add_argument("--out_dir", type=str, default="logs/codec_eval")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--segment_seconds", type=float, default=0.0)
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -120,8 +122,8 @@ def main():
     if not wavs:
         raise ValueError(f"No wav files found under {data_dir}")
 
-    random.seed(args.seed)
-    picks = random.sample(wavs, k=min(len(wavs), args.num_samples))
+    rng = random.Random(args.seed)
+    picks = rng.sample(wavs, k=min(len(wavs), args.num_samples))
 
     out_dir = PROJECT_ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +135,11 @@ def main():
     rows: List[Dict[str, Any]] = []
     for wav_path in tqdm(picks, desc="Eval"):
         gt = load_audio(wav_path, sample_rate=gcfg.sample_rate).to(device)
+        if args.segment_seconds and args.segment_seconds > 0:
+            seg_len = int(args.segment_seconds * gcfg.sample_rate)
+            if gt.numel() > seg_len:
+                start = rng.randint(0, gt.numel() - seg_len)
+                gt = gt[start : start + seg_len]
         with torch.no_grad():
             out = codec(gt, sample_latent=False)
             pred = out["recon"].squeeze(0)

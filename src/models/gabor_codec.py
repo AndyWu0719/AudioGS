@@ -52,6 +52,10 @@ class ResidualConv1d(nn.Module):
 class CodecLossWeights:
     time_l1: float = 1.0
     stft_mss: float = 0.5
+    stft_feat_l1: float = 0.0
+    complex_stft: float = 0.0
+    gabor_stft_complex: float = 0.0
+    frame_consistency: float = 0.0
     kl: float = 1e-4
     latent_l1: float = 0.0
 
@@ -73,6 +77,7 @@ class GaborFrameCodec(nn.Module):
         time_downsample: int = 4,
         use_vae: bool = False,
         dropout: float = 0.0,
+        dilation_schedule: Optional[Tuple[int, ...]] = None,
     ):
         super().__init__()
         if time_downsample <= 0:
@@ -88,8 +93,18 @@ class GaborFrameCodec(nn.Module):
         in_dim = 2 * gabor_cfg.freq_bins  # real/imag flattened per frame
 
         self.in_proj = nn.Linear(in_dim, hidden_dim)
+        if dilation_schedule is None:
+            dilations = [1] * num_layers
+        else:
+            dilations = list(dilation_schedule)
+            if len(dilations) != num_layers:
+                raise ValueError(f"dilation_schedule length {len(dilations)} != num_layers {num_layers}")
+
         self.enc_blocks = nn.ModuleList(
-            [ResidualConv1d(hidden_dim, kernel_size=5, dilation=1, dropout=dropout) for _ in range(num_layers)]
+            [
+                ResidualConv1d(hidden_dim, kernel_size=5, dilation=dilations[i], dropout=dropout)
+                for i in range(num_layers)
+            ]
         )
 
         self.to_mu = nn.Conv1d(hidden_dim, latent_dim, kernel_size=1)
@@ -97,7 +112,10 @@ class GaborFrameCodec(nn.Module):
 
         self.from_latent = nn.Conv1d(latent_dim, hidden_dim, kernel_size=1)
         self.dec_blocks = nn.ModuleList(
-            [ResidualConv1d(hidden_dim, kernel_size=5, dilation=1, dropout=dropout) for _ in range(num_layers)]
+            [
+                ResidualConv1d(hidden_dim, kernel_size=5, dilation=dilations[i], dropout=dropout)
+                for i in range(num_layers)
+            ]
         )
         self.out_proj = nn.Conv1d(hidden_dim, in_dim, kernel_size=1)
 
@@ -188,13 +206,32 @@ class GaborFrameCodec(nn.Module):
         y = istft(X_hat, self.gabor_cfg, length=num_samples)
         return y
 
-    def forward(self, waveform: torch.Tensor, sample_latent: bool = False) -> dict:
+    def forward(self, waveform: torch.Tensor, sample_latent: bool = False, return_features: bool = False) -> dict:
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
-        B, T = waveform.shape
-        z, mu, logvar = self.encode(waveform, sample=sample_latent)
-        recon = self.decode(z, num_samples=T)
-        return {"recon": recon, "z": z, "mu": mu, "logvar": logvar}
+        _, T = waveform.shape
+
+        # Compute analysis STFT once.
+        X = stft(waveform, self.gabor_cfg)  # [B, F, TT]
+        feats = stft_to_frame_features(X)  # [B, TT, 2F]
+        mu, logvar = self._encode_frames(feats)
+
+        z = mu
+        if self.use_vae and sample_latent and logvar is not None:
+            eps = torch.randn_like(mu)
+            z = mu + eps * torch.exp(0.5 * logvar)
+
+        X_hat = self.decode_to_stft(z, num_samples=T)
+        recon = istft(X_hat, self.gabor_cfg, length=T)
+
+        out = {"recon": recon, "z": z, "mu": mu, "logvar": logvar}
+        if return_features:
+            out["X"] = X
+            out["X_hat"] = X_hat
+            feats_hat = stft_to_frame_features(X_hat)
+            out["stft_feats"] = feats
+            out["stft_feats_hat"] = feats_hat
+        return out
 
     @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:

@@ -63,6 +63,7 @@ def build_codec(codec_ckpt: Path, codec_cfg: dict, device: torch.device) -> Tupl
         time_downsample=int(m.get("time_downsample", 4)),
         use_vae=bool(m.get("use_vae", False)),
         dropout=float(m.get("dropout", 0.0)),
+        dilation_schedule=tuple(m.get("dilation_schedule", [])) or None,
     ).to(device)
 
     ckpt = torch.load(codec_ckpt, map_location=device, weights_only=False)

@@ -5,3 +5,14 @@ data
 .agent
 __pycache__/
 *.pyc
+configs_c
+cuda_gabor_c
+scripts/00_atom_fitting_c
+scripts/01_encoder_training_c
+scripts/02_data_preprocessing_c
+scripts/03_encoder_eval_c
+scripts/04_flow_training_c
+scripts/05_flow_eval_c
+scripts/06_tts_inference_c
+scripts/run
+src_c

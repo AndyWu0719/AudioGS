@@ -82,7 +82,11 @@ class Visualizer:
         # Handle batched input
         if waveform.ndim > 1:
             waveform = waveform[0]
-        
+
+        # Sanitize non-finite values (can happen if upstream diverges).
+        if not np.isfinite(waveform).all():
+            waveform = np.nan_to_num(waveform, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Normalize
         if normalize:
             max_val = np.abs(waveform).max()
@@ -119,7 +123,11 @@ class Visualizer:
         
         if waveform.ndim > 1:
             waveform = waveform[0]
-        
+
+        # librosa.util.valid_audio rejects NaN/inf. Prefer a best-effort plot.
+        if not np.isfinite(waveform).all():
+            waveform = np.nan_to_num(waveform, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
         # Compute mel spectrogram
         mel_spec = librosa.feature.melspectrogram(
             y=waveform,
@@ -159,7 +167,9 @@ class Visualizer:
         # Compute spectrograms
         gt_mel_power = self.compute_mel_spectrogram(gt_waveform, return_db=False)
         pred_mel_power = self.compute_mel_spectrogram(pred_waveform, return_db=False)
-        ref_power = np.max(gt_mel_power)
+        ref_power = float(np.max(gt_mel_power))
+        if (not np.isfinite(ref_power)) or ref_power <= 0:
+            ref_power = 1e-8
         gt_mel = librosa.power_to_db(gt_mel_power, ref=ref_power)
         pred_mel = librosa.power_to_db(pred_mel_power, ref=ref_power)
         

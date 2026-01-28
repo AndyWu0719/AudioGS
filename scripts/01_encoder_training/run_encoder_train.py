@@ -33,9 +33,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.audio_dataset import LibriTTSSegmentDataset, collate_fixed_segments, scan_wavs  # noqa: E402
-from src.losses.spectral_loss import MultiResolutionSTFTLoss  # noqa: E402
+from src.losses.spectral_loss import ComplexSTFTLoss, MultiResolutionSTFTLoss  # noqa: E402
 from src.models.gabor_codec import CodecLossWeights, GaborFrameCodec  # noqa: E402
-from src.utils.gabor_frame import GaborFrameConfig  # noqa: E402
+from src.utils.gabor_frame import GaborFrameConfig, stft  # noqa: E402
 
 
 def setup_distributed() -> Tuple[int, int, int]:
@@ -82,6 +82,10 @@ def build_loss_weights(cfg: Dict[str, Any]) -> CodecLossWeights:
     return CodecLossWeights(
         time_l1=float(w.get("time_l1", 1.0)),
         stft_mss=float(w.get("stft_mss", 0.5)),
+        stft_feat_l1=float(w.get("stft_feat_l1", 0.0)),
+        complex_stft=float(w.get("complex_stft", 0.0)),
+        gabor_stft_complex=float(w.get("gabor_stft_complex", 0.0)),
+        frame_consistency=float(w.get("frame_consistency", 0.0)),
         kl=float(w.get("kl", 1e-4)),
         latent_l1=float(w.get("latent_l1", 0.0)),
     )
@@ -200,6 +204,7 @@ def main():
         time_downsample=int(model_cfg.get("time_downsample", 4)),
         use_vae=bool(model_cfg.get("use_vae", False)),
         dropout=float(model_cfg.get("dropout", 0.0)),
+        dilation_schedule=tuple(model_cfg.get("dilation_schedule", [])) or None,
     ).to(device)
 
     if world_size > 1:
@@ -214,6 +219,11 @@ def main():
         spectral_weight=1.0,
         log_mag_weight=1.0,
         time_domain_weight=0.0,
+    ).to(device)
+    complex_stft_loss = ComplexSTFTLoss(
+        fft_sizes=list(mss_cfg.get("fft_sizes", [2048, 1024, 512])),
+        hop_sizes=[s // 4 for s in list(mss_cfg.get("fft_sizes", [2048, 1024, 512]))],
+        win_lengths=list(mss_cfg.get("fft_sizes", [2048, 1024, 512])),
     ).to(device)
 
     train_cfg = cfg["training"]
@@ -252,7 +262,8 @@ def main():
         for batch in train_loader:
             wave = batch["waveforms"].to(device)  # [B, T]
 
-            out = codec(wave, sample_latent=bool(model_cfg.get("use_vae", False)))
+            # Keep memory low: we don't need per-frame real/imag features unless stft_feat_l1 is enabled.
+            out = codec(wave, sample_latent=bool(model_cfg.get("use_vae", False)), return_features=False)
             recon = out["recon"]
             z = out["z"]
             mu = out["mu"]
@@ -262,6 +273,29 @@ def main():
             loss_time = F.l1_loss(recon, wave)
             loss_stft, _ = stft_loss(recon, wave)
             loss = loss_weights.time_l1 * loss_time + loss_weights.stft_mss * loss_stft
+
+            # Frame-consistent losses (aligned with the codec's analysis window):
+            #  - gabor_stft_complex: match predicted complex STFT to GT complex STFT
+            #  - frame_consistency: enforce predicted STFT lies in the range of the analysis operator
+            if loss_weights.gabor_stft_complex > 0 or loss_weights.frame_consistency > 0:
+                codec_mod = codec.module if isinstance(codec, DDP) else codec
+                X_hat = codec_mod.decode_to_stft(z, num_samples=wave.shape[-1])
+                with torch.no_grad():
+                    X_gt = stft(wave, gabor_cfg)
+                if loss_weights.gabor_stft_complex > 0:
+                    loss_gabor_c = (X_hat - X_gt).abs().mean()
+                    loss = loss + loss_weights.gabor_stft_complex * loss_gabor_c
+                if loss_weights.frame_consistency > 0:
+                    # Project predicted coefficients onto the analysis operator range via ISTFT->STFT.
+                    X_proj = stft(recon, gabor_cfg)
+                    loss_fc = (X_hat - X_proj).abs().mean()
+                    loss = loss + loss_weights.frame_consistency * loss_fc
+
+            if loss_weights.complex_stft > 0:
+                loss_cstft = complex_stft_loss(recon, wave)
+                loss = loss + loss_weights.complex_stft * loss_cstft
+
+            # Kept for backward-compat configs. If enabled, flip return_features=True above.
 
             if loss_weights.latent_l1 > 0:
                 loss = loss + loss_weights.latent_l1 * z.abs().mean()
@@ -280,14 +314,19 @@ def main():
                 scheduler.step()
 
             if is_main() and step % log_interval == 0:
-                pbar.set_postfix(
-                    {
-                        "loss": f"{loss.item()*accum_steps:.4f}",
-                        "l_time": f"{loss_time.item():.4f}",
-                        "l_stft": f"{loss_stft.item():.4f}",
-                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                    }
-                )
+                postfix = {
+                    "loss": f"{loss.item()*accum_steps:.4f}",
+                    "l_time": f"{loss_time.item():.4f}",
+                    "l_stft": f"{loss_stft.item():.4f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                }
+                if loss_weights.complex_stft > 0:
+                    postfix["l_cstft"] = f"{loss_cstft.item():.4f}"
+                if loss_weights.gabor_stft_complex > 0:
+                    postfix["l_gabor_c"] = f"{loss_gabor_c.item():.4f}"
+                if loss_weights.frame_consistency > 0:
+                    postfix["l_fc"] = f"{loss_fc.item():.4f}"
+                pbar.set_postfix(postfix)
 
             if is_main() and step % val_interval == 0 and step > 0:
                 codec.eval()
